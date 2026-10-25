@@ -2,7 +2,7 @@
 
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org); the release workflow publishes the section of the tagged version as the release notes.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-10-25
 
 First release. Windows 10 / 11 and Linux, x64.
 
