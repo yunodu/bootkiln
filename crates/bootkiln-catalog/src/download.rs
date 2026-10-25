@@ -4,6 +4,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -11,6 +14,12 @@ use sha2::{Digest, Sha256};
 use crate::{Error, Release, http};
 
 const CHUNK: usize = 1024 * 1024;
+/// A download that receives nothing for this long fails (and can be resumed).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a quiet connection still checks for pause / cancel.
+const POLL: Duration = Duration::from_millis(500);
+/// Chunks buffered between the network reader thread and the writer.
+const CHANNEL_CHUNKS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +35,15 @@ pub enum Stage {
 pub fn download(
     release: &Release,
     dir: &Path,
+    progress: &mut dyn FnMut(Stage, u64, u64) -> Result<(), Error>,
+) -> Result<PathBuf, Error> {
+    download_with_idle(release, dir, IDLE_TIMEOUT, progress)
+}
+
+fn download_with_idle(
+    release: &Release,
+    dir: &Path,
+    idle: Duration,
     progress: &mut dyn FnMut(Stage, u64, u64) -> Result<(), Error>,
 ) -> Result<PathBuf, Error> {
     let name = Path::new(&release.file_name)
@@ -45,7 +63,7 @@ pub fn download(
         fs::remove_file(&path)?;
     }
 
-    let result = fetch(release, &part, progress);
+    let result = fetch(release, &part, idle, progress);
     match result {
         Ok(digest) if digest == release.sha256 => {
             fs::rename(&part, &path)?;
@@ -70,6 +88,7 @@ pub fn download(
 fn fetch(
     release: &Release,
     part: &Path,
+    idle: Duration,
     progress: &mut dyn FnMut(Stage, u64, u64) -> Result<(), Error>,
 ) -> Result<String, Error> {
     let mut hasher = Sha256::new();
@@ -94,18 +113,50 @@ fn fetch(
     } else {
         File::create(part)?
     };
+    // A reader thread hands over chunks, so a silent connection cannot block this loop:
+    // pause and cancel stay responsive, and a stall becomes an error after `idle`.
+    let (chunks, received) = mpsc::sync_channel::<std::io::Result<Vec<u8>>>(CHANNEL_CHUNKS);
     let mut body = response.into_body().into_reader();
-    let mut buf = vec![0u8; CHUNK];
+    thread::spawn(move || {
+        loop {
+            let mut buf = vec![0u8; CHUNK];
+            let read = body.read(&mut buf).map(|n| {
+                buf.truncate(n);
+                buf
+            });
+            let end = !matches!(&read, Ok(b) if !b.is_empty());
+            if chunks.send(read).is_err() || end {
+                return;
+            }
+        }
+    });
+
     let mut done = offset;
+    let mut quiet = Duration::ZERO;
     progress(Stage::Downloading, done, total)?;
     loop {
-        let n = body.read(&mut buf).map_err(|e| Error::Http(format!("{}: {e}", release.file_name)))?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])?;
-        hasher.update(&buf[..n]);
-        done += n as u64;
+        let chunk = match received.recv_timeout(POLL) {
+            Ok(Ok(chunk)) if chunk.is_empty() => break,
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(e)) => return Err(Error::Http(format!("{}: {e}", release.file_name))),
+            Err(RecvTimeoutError::Timeout) => {
+                quiet += POLL;
+                if quiet >= idle {
+                    return Err(Error::Http(format!(
+                        "{}: no data for {} s; try again to resume",
+                        release.file_name,
+                        idle.as_secs()
+                    )));
+                }
+                progress(Stage::Downloading, done, total)?;
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        quiet = Duration::ZERO;
+        file.write_all(&chunk)?;
+        hasher.update(&chunk);
+        done += chunk.len() as u64;
         progress(Stage::Downloading, done, total)?;
     }
     file.sync_all()?;
@@ -166,6 +217,11 @@ mod tests {
     }
 
     fn serve(data: Vec<u8>, honour_ranges: bool) -> Server {
+        serve_with(data, honour_ranges, None)
+    }
+
+    /// `stall_after`: send that many body bytes, then keep the connection open silently.
+    fn serve_with(data: Vec<u8>, honour_ranges: bool, stall_after: Option<usize>) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/file.iso", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -191,7 +247,13 @@ mod tests {
                 let body = &data[start..];
                 let head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 stream.write_all(head.as_bytes()).unwrap();
-                stream.write_all(body).unwrap();
+                match stall_after {
+                    Some(n) => {
+                        stream.write_all(&body[..n]).unwrap();
+                        thread::sleep(Duration::from_secs(10));
+                    }
+                    None => stream.write_all(body).unwrap(),
+                }
             }
         });
         Server { url, requests }
@@ -294,5 +356,33 @@ mod tests {
         assert!(matches!(err, Error::Cancelled), "{err:?}");
         assert!(!dir.join("file.iso.part").exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn silent_connection_fails_after_the_idle_time_and_keeps_the_part() {
+        let data = data();
+        let server = serve_with(data.clone(), true, Some(CHUNK));
+        let dir = temp_dir("stall");
+        let started = std::time::Instant::now();
+        let err = download_with_idle(&release(&server.url, &data), &dir, Duration::from_secs(2), &mut quiet).unwrap_err();
+        assert!(matches!(&err, Error::Http(m) if m.contains("no data")), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(8), "did not wait for the server");
+        assert_eq!(fs::metadata(dir.join("file.iso.part")).unwrap().len(), CHUNK as u64);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cancel_works_while_the_connection_is_silent() {
+        let data = data();
+        let server = serve_with(data.clone(), true, Some(1000));
+        let dir = temp_dir("stallcancel");
+        let started = std::time::Instant::now();
+        let err = download(&release(&server.url, &data), &dir, &mut |_, _, _| {
+            if started.elapsed() > Duration::from_secs(1) { Err(Error::Cancelled) } else { Ok(()) }
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

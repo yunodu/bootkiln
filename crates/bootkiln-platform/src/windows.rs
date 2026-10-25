@@ -153,6 +153,9 @@ impl DiskBackend for WindowsBackend {
              }}\n\
              if (-not $p) {{ throw 'the new NTFS partition did not appear' }}\n\
              $v = $p | Format-Volume -FileSystem NTFS -NewFileSystemLabel '{label}' -Force -Confirm:$false\n\
+             # The small boot partition (UEFI:NTFS) needs no drive letter; Windows gives it one.\n\
+             Get-Partition -DiskNumber {disk} | Where-Object {{ $_.Offset -ne {partition_offset} -and \"$($_.DriveLetter)\" -match '^[A-Z]$' }} |\n\
+                 ForEach-Object {{ Remove-PartitionAccessPath -InputObject $_ -AccessPath \"$($_.DriveLetter):\\\" -ErrorAction SilentlyContinue }}\n\
              $v.Path",
             disk = drive.number,
             label = label.replace('\'', "''"),

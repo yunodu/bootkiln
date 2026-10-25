@@ -31,7 +31,8 @@ pub enum DiscKind {
     Dir(Vec<DiscEntry>),
     /// Data extents in file order.
     File(Vec<Extent>),
-    Symlink,
+    /// Symbolic link, with its target path when the image records one (Rock Ridge).
+    Symlink(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

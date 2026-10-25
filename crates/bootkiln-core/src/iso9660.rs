@@ -24,6 +24,11 @@ const FLAG_DIRECTORY: u8 = 0x02;
 const FLAG_MULTI_EXTENT: u8 = 0x80;
 const S_IFMT: u32 = 0o170000;
 const S_IFLNK: u32 = 0o120000;
+/// Rock Ridge SL component record flags.
+const SL_CONTINUE: u8 = 0x01;
+const SL_CURRENT: u8 = 0x02;
+const SL_PARENT: u8 = 0x04;
+const SL_ROOT: u8 = 0x08;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Naming {
@@ -119,8 +124,37 @@ struct TreeReader<'a, R> {
 struct RockRidge {
     name: Option<Vec<u8>>,
     symlink: bool,
+    /// SL path components; "" first means an absolute path.
+    link: Option<Vec<String>>,
+    /// The last SL component continues in the next component record.
+    link_component_open: bool,
     relocated: bool,
     child_link: Option<u32>,
+}
+
+impl RockRidge {
+    /// Append one SL entry's component records (flags, length, content).
+    fn add_link_components(&mut self, entry: &[u8]) {
+        self.symlink = true;
+        let components = self.link.get_or_insert_with(Vec::new);
+        let mut pos = 5;
+        while pos + 2 <= entry.len() {
+            let (flags, len) = (entry[pos], usize::from(entry[pos + 1]));
+            let Some(content) = entry.get(pos + 2..pos + 2 + len) else { break };
+            let text = match flags & (SL_CURRENT | SL_PARENT | SL_ROOT) {
+                SL_CURRENT => ".".to_owned(),
+                SL_PARENT => "..".to_owned(),
+                SL_ROOT => String::new(),
+                _ => String::from_utf8_lossy(content).into_owned(),
+            };
+            match components.last_mut() {
+                Some(last) if self.link_component_open => last.push_str(&text),
+                _ => components.push(text),
+            }
+            self.link_component_open = flags & SL_CONTINUE != 0;
+            pos += 2 + len;
+        }
+    }
 }
 
 impl<R: Read + Seek> TreeReader<'_, R> {
@@ -185,7 +219,8 @@ impl<R: Read + Seek> TreeReader<'_, R> {
             let location = (le32(record, 2), le32(record, 10));
 
             if rr.symlink {
-                entries.push(DiscEntry { name, recorded, kind: DiscKind::Symlink });
+                let target = rr.link.as_ref().map(|parts| if parts == &[""] { "/".to_owned() } else { parts.join("/") });
+                entries.push(DiscEntry { name, recorded, kind: DiscKind::Symlink(target) });
                 continue;
             }
             if let Some(child_lba) = rr.child_link {
@@ -245,7 +280,7 @@ impl<R: Read + Seek> TreeReader<'_, R> {
                 match &entry[..2] {
                     b"NM" if len >= 5 => rr.name.get_or_insert_with(Vec::new).extend_from_slice(&entry[5..]),
                     b"PX" if len >= 12 => rr.symlink |= le32(entry, 4) & S_IFMT == S_IFLNK,
-                    b"SL" => rr.symlink = true,
+                    b"SL" if len >= 5 => rr.add_link_components(entry),
                     b"RE" => rr.relocated = true,
                     b"CL" if len >= 8 => rr.child_link = Some(le32(entry, 4)),
                     b"CE" if len >= 28 => {
@@ -355,11 +390,21 @@ mod tests {
     }
 
     #[test]
-    fn rock_ridge_symlinks_are_reported_not_followed() {
+    fn rock_ridge_symlink_targets_are_read_with_continued_components() {
         let mut iso = IsoBuilder::new("X", IsoNaming::RockRidge);
-        iso.symlink(None, "ubuntu");
+        iso.symlink(None, "ubuntu", ".");
+        iso.symlink(None, "faq", "../doc/FAQ/html/index.html");
+        iso.symlink(None, "abs", "/usr/share/common-licenses");
         let tree = read_tree(&mut Cursor::new(iso.build())).unwrap();
-        assert!(matches!(tree.root[0].kind, DiscKind::Symlink));
+        let targets: Vec<Option<&str>> = tree
+            .root
+            .iter()
+            .map(|e| match &e.kind {
+                DiscKind::Symlink(target) => target.as_deref(),
+                _ => panic!("{} is not a symlink", e.name),
+            })
+            .collect();
+        assert_eq!(targets, [Some("."), Some("../doc/FAQ/html/index.html"), Some("/usr/share/common-licenses")]);
     }
 
     #[test]

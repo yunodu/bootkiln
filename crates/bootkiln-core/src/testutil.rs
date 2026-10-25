@@ -66,7 +66,7 @@ pub enum IsoNaming {
 enum IsoNode {
     Dir { name: String, parent: Option<usize> },
     File { name: String, parent: Option<usize>, parts: Vec<Vec<u8>> },
-    Symlink { name: String, parent: Option<usize> },
+    Symlink { name: String, parent: Option<usize>, target: String },
 }
 
 impl IsoNode {
@@ -107,9 +107,11 @@ impl IsoBuilder {
         self.nodes.push(IsoNode::File { name: name.to_owned(), parent, parts: parts.to_vec() });
     }
 
-    pub fn symlink(&mut self, parent: Option<usize>, name: &str) {
+    /// Components longer than four bytes are split across two SL component records, so
+    /// readers must join continued components.
+    pub fn symlink(&mut self, parent: Option<usize>, name: &str, target: &str) {
         assert!(self.naming == IsoNaming::RockRidge, "symlinks need Rock Ridge");
-        self.nodes.push(IsoNode::Symlink { name: name.to_owned(), parent });
+        self.nodes.push(IsoNode::Symlink { name: name.to_owned(), parent, target: target.to_owned() });
     }
 
     pub fn build(&self) -> Vec<u8> {
@@ -162,12 +164,33 @@ impl IsoBuilder {
                     }
                     match node {
                         IsoNode::Dir { .. } => sector.extend(iso_record(&raw, dir_lba(tree, Some(i)), ISO_SECTOR, 2, &su)),
-                        IsoNode::Symlink { .. } => {
+                        IsoNode::Symlink { target, .. } => {
                             let mut px = vec![b'P', b'X', 36, 1];
                             px.extend(0o120777u32.to_le_bytes());
                             px.extend(0o120777u32.to_be_bytes());
                             px.resize(36, 0);
                             su.extend(px);
+                            let mut records = Vec::new();
+                            for (n, component) in target.split('/').enumerate() {
+                                match component {
+                                    "" if n == 0 => records.extend([0x08, 0]),
+                                    "" => {}
+                                    "." => records.extend([0x02, 0]),
+                                    ".." => records.extend([0x04, 0]),
+                                    c if c.len() > 4 => {
+                                        records.extend([0x01, 4]);
+                                        records.extend(&c.as_bytes()[..4]);
+                                        records.extend([0, (c.len() - 4) as u8]);
+                                        records.extend(&c.as_bytes()[4..]);
+                                    }
+                                    c => {
+                                        records.extend([0, c.len() as u8]);
+                                        records.extend(c.as_bytes());
+                                    }
+                                }
+                            }
+                            su.extend([b'S', b'L', 5 + records.len() as u8, 1, 0]);
+                            su.extend(records);
                             sector.extend(iso_record(&raw, 0, 0, 0, &su));
                         }
                         IsoNode::File { parts, .. } => {

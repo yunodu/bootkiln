@@ -69,13 +69,14 @@ pub fn prepare<R: Read + Seek>(image: &mut R) -> Result<IsoContent, Error> {
 
     let mut converter = Converter {
         image,
+        root: &tree.root,
         iso_label: &tree.label,
         label: &label,
         patched: Vec::new(),
         skipped_symlinks: Vec::new(),
         merged_duplicates: Vec::new(),
     };
-    let nodes = converter.convert(&tree.root, "")?;
+    let nodes = converter.convert(&tree.root, "", &[])?;
     let Converter { patched, skipped_symlinks, merged_duplicates, .. } = converter;
     Ok(IsoContent {
         iso_label: tree.label,
@@ -166,6 +167,8 @@ fn fat_name(name: &str) -> String {
 
 struct Converter<'a, R> {
     image: &'a mut R,
+    /// The whole tree, for resolving symbolic links.
+    root: &'a [DiscEntry],
     iso_label: &'a str,
     label: &'a str,
     patched: Vec<String>,
@@ -174,23 +177,39 @@ struct Converter<'a, R> {
 }
 
 impl<R: Read + Seek> Converter<'_, R> {
-    fn convert(&mut self, entries: &[DiscEntry], dir_path: &str) -> Result<Vec<Node>, Error> {
+    /// `disc_dir`: the directory's components as named on the disc (before FAT renaming).
+    fn convert(&mut self, entries: &[DiscEntry], dir_path: &str, disc_dir: &[&str]) -> Result<Vec<Node>, Error> {
         let mut nodes: Vec<Node> = Vec::with_capacity(entries.len());
         // Upper-cased name -> index in `nodes`.
         let mut by_name: HashMap<String, usize> = HashMap::new();
         for entry in entries {
             let name = fat_name(&entry.name);
             let path = format!("{dir_path}/{name}");
-            let kind = match &entry.kind {
-                DiscKind::Symlink => {
-                    self.skipped_symlinks.push(path);
-                    continue;
+            let extents = match &entry.kind {
+                DiscKind::Symlink(target) => {
+                    // FAT has no links: a link to a file becomes a copy of it; links to
+                    // directories are skipped (they often loop, like Ubuntu's `ubuntu -> .`).
+                    match target.as_deref().and_then(|t| resolve_link(self.root, disc_dir, t)) {
+                        Some(extents) => Some(extents),
+                        None => {
+                            self.skipped_symlinks.push(path);
+                            continue;
+                        }
+                    }
                 }
-                DiscKind::Dir(children) => NodeKind::Dir(self.convert(children, &path)?),
-                DiscKind::File(extents) => {
+                DiscKind::File(extents) => Some(extents.as_slice()),
+                DiscKind::Dir(_) => None,
+            };
+            let kind = match (extents, &entry.kind) {
+                (Some(extents), _) => {
                     let sources = extents.iter().map(|e| Source::Image { offset: e.offset, len: e.len }).collect();
                     NodeKind::File(self.patch_config(&name, &path, sources)?)
                 }
+                (None, DiscKind::Dir(children)) => {
+                    let child_dir: Vec<&str> = disc_dir.iter().copied().chain([entry.name.as_str()]).collect();
+                    NodeKind::Dir(self.convert(children, &path, &child_dir)?)
+                }
+                (None, _) => unreachable!("only directories have no extents here"),
             };
             let node = Node { name, modified: dos_time(entry.recorded), kind };
 
@@ -251,6 +270,40 @@ impl<R: Read + Seek> Converter<'_, R> {
         }
         Ok(true)
     }
+}
+
+/// Links followed in a row before giving up (guards against loops).
+const MAX_LINK_HOPS: usize = 8;
+
+/// The extents of the file a symbolic link in `dir` points to, following links up to
+/// [`MAX_LINK_HOPS`]; `None` for directories, dangling links and links leaving the disc.
+fn resolve_link<'t>(root: &'t [DiscEntry], dir: &[&str], target: &str) -> Option<&'t [disc::Extent]> {
+    let mut path: Vec<String> = dir.iter().map(|c| (*c).to_owned()).collect();
+    let mut target = target.to_owned();
+    for _ in 0..MAX_LINK_HOPS {
+        if target.starts_with('/') {
+            path.clear();
+        }
+        for component in target.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    path.pop()?;
+                }
+                name => path.push(name.to_owned()),
+            }
+        }
+        let components: Vec<&str> = path.iter().map(String::as_str).collect();
+        match &disc::find(root, &components)?.kind {
+            DiscKind::File(extents) => return Some(extents),
+            DiscKind::Symlink(Some(next)) => {
+                path.pop();
+                target = next.clone();
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Fill `buf` with the bytes at `offset` of the concatenated `sources`.
@@ -334,7 +387,7 @@ mod tests {
         iso.file(Some(boot), "grub.cfg", GRUB_CFG.as_bytes().to_vec());
         let live = iso.dir(None, "LiveOS");
         iso.file(Some(live), "squashfs.img", pattern(300_000));
-        iso.symlink(None, "fedora");
+        iso.symlink(None, "fedora", ".");
         iso
     }
 
@@ -350,6 +403,31 @@ mod tests {
         let mut data = Vec::new();
         fs.root_dir().open_file(path).unwrap().read_to_end(&mut data).unwrap();
         data
+    }
+
+    #[test]
+    fn file_links_become_copies_and_other_links_are_skipped() {
+        let mut iso = fedora_like();
+        let doc = iso.dir(None, "doc");
+        iso.file(Some(doc), "faq.html", b"<h1>FAQ</h1>".to_vec());
+        let html = iso.dir(Some(doc), "html");
+        iso.symlink(Some(html), "relative.html", "../faq.html");
+        iso.symlink(None, "absolute.html", "/doc/faq.html");
+        iso.symlink(None, "chain.html", "absolute.html");
+        iso.symlink(None, "loop-a", "loop-b");
+        iso.symlink(None, "loop-b", "loop-a");
+        iso.symlink(None, "dangling", "nowhere/file");
+        iso.symlink(None, "escape", "../../etc/passwd");
+        let image = iso.build();
+        let (content, disk) = write_to_disk(&image);
+
+        let mut skipped = content.skipped_symlinks.clone();
+        skipped.sort();
+        assert_eq!(skipped, ["/dangling", "/escape", "/fedora", "/loop-a", "/loop-b"]);
+        let fs = fatfs::FileSystem::new(Cursor::new(disk.data[1024 * 1024..].to_vec()), FsOptions::new()).unwrap();
+        for path in ["doc/html/relative.html", "absolute.html", "chain.html"] {
+            assert_eq!(read_file(&fs, path), b"<h1>FAQ</h1>", "{path}");
+        }
     }
 
     #[test]

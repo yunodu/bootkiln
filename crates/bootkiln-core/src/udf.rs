@@ -260,7 +260,7 @@ impl<R: Read + Seek> Reader<'_, R> {
             let kind = match entry.file_type {
                 FILE_TYPE_DIRECTORY => DiscKind::Dir(self.read_dir(&entry, depth + 1)?),
                 FILE_TYPE_REGULAR => DiscKind::File(entry.extents),
-                FILE_TYPE_SYMLINK => DiscKind::Symlink,
+                FILE_TYPE_SYMLINK => DiscKind::Symlink(None),
                 _ => continue, // Streams, devices and other special files have no data to copy.
             };
             entries.push(DiscEntry { name, recorded: entry.modified, kind });
