@@ -48,3 +48,8 @@ pub fn host_region() -> io::Result<Region> {
         time_zone,
     })
 }
+
+/// The user's locale as a BCP 47 name such as `de-DE`.
+pub fn host_locale() -> Option<String> {
+    host_region().ok().map(|r| r.user_locale)
+}

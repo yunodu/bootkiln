@@ -1,6 +1,9 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bootkiln_core::image;
@@ -11,6 +14,9 @@ use bootkiln_core::{DiskBackend, Drive, Plan, verify_plan};
 use bootkiln_platform::{NativeBackend, host_region};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+
+/// `--json-progress` lines are throttled to this interval (phase changes always print).
+const JSON_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
 #[command(name = "bootkiln", version, about = "Write bootable disk images to USB drives")]
@@ -69,6 +75,10 @@ struct WriteArgs {
     /// Skip read-back verification
     #[arg(long)]
     no_verify: bool,
+    /// For the GUI's privileged helper: no confirmation, JSON progress lines on stdout,
+    /// cancel with a `cancel` line (or end of input) on stdin
+    #[arg(long, hide = true)]
+    json_progress: bool,
     #[command(flatten)]
     windows: WindowsOptions,
 }
@@ -169,6 +179,9 @@ fn list(backend: &dyn DiskBackend) -> Result<()> {
 
 fn write(backend: &dyn DiskBackend, args: &WriteArgs) -> Result<()> {
     require_elevated(backend)?;
+    if args.json_progress {
+        return write_json(backend, args);
+    }
     let customisations = args.windows.customisations()?;
     let mut file = open(&args.image)?;
     let drive = job::target_drive(backend, args.drive, &args.image)?;
@@ -218,6 +231,48 @@ fn write(backend: &dyn DiskBackend, args: &WriteArgs) -> Result<()> {
             }
         }
     );
+    Ok(())
+}
+
+/// `write --json-progress`: one JSON object per stdout line, `{"phase","done","total"}`
+/// during the write, then `{"note"}` on success or `{"cancelled":true}`. Errors go to
+/// stderr with a non-zero exit code.
+fn write_json(backend: &dyn DiskBackend, args: &WriteArgs) -> Result<()> {
+    let customisations = args.windows.customisations()?;
+    let mut file = open(&args.image)?;
+    let drive = job::target_drive(backend, args.drive, &args.image)?;
+    let mut analysis = job::analyze(&mut file, args.mode.into(), args.force)
+        .with_context(|| format!("reading {}", args.image.display()))?;
+    analysis.customise(&customisations)?;
+    let job = analysis.plan(&drive)?;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancel);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        // A `cancel` line, end of input or a read error (the GUI is gone) all cancel.
+        while io::stdin().read_line(&mut line).is_ok_and(|n| n > 0) && line.trim() != "cancel" {
+            line.clear();
+        }
+        flag.store(true, Ordering::SeqCst);
+    });
+
+    let mut last: Option<(Phase, Instant)> = None;
+    let result = job.run(&mut file, backend, &drive, !args.no_verify, &mut |phase, done, total| {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(bootkiln_core::Error::Cancelled);
+        }
+        if last.is_none_or(|(p, at)| p != phase || at.elapsed() >= JSON_PROGRESS_INTERVAL || done == total) {
+            last = Some((phase, Instant::now()));
+            println!(r#"{{"phase":"{}","done":{done},"total":{total}}}"#, phase.name());
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => println!(r#"{{"note":"{}"}}"#, job.note().name()),
+        Err(bootkiln_core::Error::Cancelled) => println!(r#"{{"cancelled":true}}"#),
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 
@@ -297,7 +352,7 @@ fn verify(backend: &dyn DiskBackend, image_path: &Path, drive_no: u32) -> Result
 fn windows_language(lang: Option<&str>) -> String {
     lang.map(str::to_owned)
         .or_else(|| {
-            host_region().ok().and_then(|r| bootkiln_catalog::default_windows_language(&r.user_locale)).map(str::to_owned)
+            bootkiln_platform::host_locale().and_then(|l| bootkiln_catalog::default_windows_language(&l)).map(str::to_owned)
         })
         .unwrap_or_else(|| bootkiln_catalog::WINDOWS_LANGUAGE_FALLBACK.to_owned())
 }
@@ -372,7 +427,10 @@ fn download(id: &str, lang: Option<&str>, dir: Option<PathBuf>) -> Result<()> {
 
 fn require_elevated(backend: &dyn DiskBackend) -> Result<()> {
     if !backend.is_elevated() {
-        bail!("raw disk access needs administrator rights; run bootkiln from an elevated terminal");
+        if cfg!(windows) {
+            bail!("raw disk access needs administrator rights; run bootkiln from an elevated terminal");
+        }
+        bail!("raw disk access needs root; run bootkiln with sudo");
     }
     Ok(())
 }

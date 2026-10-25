@@ -72,6 +72,7 @@ export interface Finished {
 }
 
 export const mica = () => invoke<boolean>("mica");
+export const platform = () => invoke<"windows" | "linux">("platform");
 export const listDrives = () => invoke<Drive[]>("list_drives");
 export const analyzeImage = (path: string, mode: Mode) =>
   invoke<ImageInfo>("analyze_image", { path, mode, force: false });

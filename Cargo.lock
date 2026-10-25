@@ -376,6 +376,7 @@ dependencies = [
  "bootkiln-core",
  "bootkiln-platform",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -387,6 +388,7 @@ name = "bootkiln-platform"
 version = "0.1.0"
 dependencies = [
  "bootkiln-core",
+ "libc",
  "windows-sys 0.61.2",
 ]
 

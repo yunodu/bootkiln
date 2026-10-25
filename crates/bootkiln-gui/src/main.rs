@@ -4,6 +4,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod downloads;
+#[cfg(target_os = "linux")]
+mod helper;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -216,6 +218,12 @@ fn mica() -> bool {
     windows_build().is_some_and(|b| b >= FIRST_MICA_BUILD)
 }
 
+/// "windows" or "linux"; the UI hides what the platform lacks (copying the region).
+#[tauri::command]
+fn platform() -> &'static str {
+    std::env::consts::OS
+}
+
 #[tauri::command]
 fn list_drives() -> Result<Vec<DriveView>, String> {
     safe_drives(&NativeBackend)
@@ -260,23 +268,21 @@ fn start_write(app: AppHandle, state: State<'_, Arc<WriteState>>, request: Write
     state.cancel.store(false, Ordering::SeqCst);
     let state = Arc::clone(&state);
     thread::spawn(move || {
-        let result = prepare(&request).and_then(|(mut file, drive, job)| {
-            let mut last: Option<(Phase, Instant)> = None;
-            job.run(&mut file, &NativeBackend, &drive, request.verify, &mut |phase, done, total| {
-                if state.cancel.load(Ordering::SeqCst) {
-                    return Err(Error::Cancelled);
-                }
-                let due = last.is_none_or(|(p, at)| p != phase || at.elapsed() >= PROGRESS_INTERVAL || done == total);
-                if due {
-                    last = Some((phase, Instant::now()));
-                    let _ = app.emit("write-progress", ProgressEvent { phase: phase_name(phase), done, total });
-                }
-                Ok(())
-            })?;
-            Ok(job.note())
-        });
+        let mut last: Option<(Phase, Instant)> = None;
+        let mut progress = |phase: Phase, done: u64, total: u64| {
+            if state.cancel.load(Ordering::SeqCst) {
+                return Err(Error::Cancelled);
+            }
+            let due = last.is_none_or(|(p, at)| p != phase || at.elapsed() >= PROGRESS_INTERVAL || done == total);
+            if due {
+                last = Some((phase, Instant::now()));
+                let _ = app.emit("write-progress", ProgressEvent { phase: phase.name(), done, total });
+            }
+            Ok(())
+        };
+        let result = run_write(&request, &mut progress);
         let event = match result {
-            Ok(note) => FinishedEvent { ok: true, cancelled: false, error: None, note: Some(note_name(note)) },
+            Ok(note) => FinishedEvent { ok: true, cancelled: false, error: None, note: Some(note.name()) },
             Err(Error::Cancelled) => FinishedEvent { ok: false, cancelled: true, error: None, note: None },
             Err(e) => FinishedEvent { ok: false, cancelled: false, error: Some(e.to_string()), note: None },
         };
@@ -303,22 +309,15 @@ async fn eject_drive(number: u32) -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
-fn phase_name(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Writing => "writing",
-        Phase::Verifying => "verifying",
-        Phase::Formatting => "formatting",
-        Phase::Copying => "copying",
-        Phase::VerifyingFiles => "verifyingFiles",
+fn run_write(request: &WriteRequest, progress: &mut dyn FnMut(Phase, u64, u64) -> Result<(), Error>) -> Result<Note, Error> {
+    // Linux desktop users are not root: the write runs in the pkexec helper.
+    #[cfg(target_os = "linux")]
+    if !NativeBackend.is_elevated() {
+        return helper::write(request, progress);
     }
-}
-
-fn note_name(note: Note) -> &'static str {
-    match note {
-        Note::FormatPrompt => "formatPrompt",
-        Note::UefiOnly => "uefiOnly",
-        Note::UefiNtfs => "uefiNtfs",
-    }
+    let (mut file, drive, job) = prepare(request)?;
+    job.run(&mut file, &NativeBackend, &drive, request.verify, progress)?;
+    Ok(job.note())
 }
 
 fn open(path: &Path) -> Result<File, Error> {
@@ -356,6 +355,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             mica,
+            platform,
             list_drives,
             analyze_image,
             check_write,

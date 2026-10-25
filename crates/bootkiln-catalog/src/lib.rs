@@ -104,12 +104,18 @@ pub(crate) fn checksum_for(sums: &str, file: &str) -> Option<String> {
     })
 }
 
-/// `downloads` next to the running executable: bootkiln is portable, so its downloads live
-/// with it.
+/// Windows: `downloads` next to the running executable (bootkiln is portable, so its
+/// downloads live with it). Linux: `~/Downloads/bootkiln`, since an AppImage's own folder
+/// is read-only.
 pub fn default_download_dir() -> std::io::Result<std::path::PathBuf> {
-    let exe = std::env::current_exe()?;
-    let dir = exe.parent().ok_or_else(|| std::io::Error::other("the executable has no folder"))?;
-    Ok(dir.join("downloads"))
+    if cfg!(windows) {
+        let exe = std::env::current_exe()?;
+        let dir = exe.parent().ok_or_else(|| std::io::Error::other("the executable has no folder"))?;
+        Ok(dir.join("downloads"))
+    } else {
+        let home = std::env::var_os("HOME").ok_or_else(|| std::io::Error::other("HOME is not set"))?;
+        Ok(std::path::Path::new(&home).join("Downloads").join("bootkiln"))
+    }
 }
 
 /// Dotted numeric versions ("26.04.1") as comparable vectors; `None` for anything else.

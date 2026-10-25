@@ -58,6 +58,7 @@
   let windowsLanguage = $state("");
   let download = $state<DownloadView | null>(null);
   let update = $state<api.Update | null>(null);
+  let canCopyRegion = $state(false);
   let downloading: { release: api.Release; entry: api.CatalogEntry } | null = null;
 
   let drive = $derived(drives.find((d) => d.number === driveNumber) ?? null);
@@ -266,6 +267,7 @@
 
   onMount(() => {
     api.mica().then((on) => document.documentElement.classList.toggle("mica", on));
+    api.platform().then((p) => (canCopyRegion = p === "windows"));
     // Notify only; offline or a GitHub hiccup just means no notice.
     api.checkUpdate().then((u) => (update = u), () => {});
     api.listDrives().then(setDrives, (e) => (checkError = String(e)));
@@ -322,7 +324,7 @@
         onCancelDownload={cancelDownload}
       />
       {#if info?.windows}
-        <WindowsCard windows={info.windows} bind:options={winOptions} bind:localAccount bind:accountName />
+        <WindowsCard windows={info.windows} bind:options={winOptions} bind:localAccount bind:accountName {canCopyRegion} />
       {/if}
       <AdvancedCard bind:mode bind:verify />
     {/if}

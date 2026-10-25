@@ -9,7 +9,15 @@
     options = $bindable(),
     localAccount = $bindable(),
     accountName = $bindable(),
-  }: { windows: WindowsInfo; options: WindowsOptions; localAccount: boolean; accountName: string } = $props();
+    canCopyRegion,
+  }: {
+    windows: WindowsInfo;
+    options: WindowsOptions;
+    localAccount: boolean;
+    accountName: string;
+    /** Windows hosts only: Linux has no Windows keyboard / time-zone ids to copy. */
+    canCopyRegion: boolean;
+  } = $props();
 
   let isWindows10 = $derived(windows.isWindows11 === false);
   $effect(() => {
@@ -28,7 +36,9 @@
   <Toggle bind:checked={localAccount} label={t.winLocal} hint={t.winLocalHint}>
     <input class="field" bind:value={accountName} placeholder={t.winLocalPlaceholder} maxlength="20" spellcheck="false" />
   </Toggle>
-  <Toggle bind:checked={options.copyRegion} label={t.winRegion} hint={t.winRegionHint} />
+  {#if canCopyRegion}
+    <Toggle bind:checked={options.copyRegion} label={t.winRegion} hint={t.winRegionHint} />
+  {/if}
   <Toggle bind:checked={options.skipPrivacyQuestions} label={t.winPrivacy} hint={t.winPrivacyHint} />
   <Toggle bind:checked={options.disableBitlocker} label={t.winBitlocker} hint={t.winBitlockerHint} />
 </Card>

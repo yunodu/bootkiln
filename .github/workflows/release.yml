@@ -35,39 +35,94 @@ jobs:
           npm run build
           cargo test --locked
 
-      - name: Build the GUI
-        working-directory: crates/bootkiln-gui
-        run: npx tauri build --no-bundle
+      - name: Build
+        run: |
+          cargo build --release --locked -p bootkiln-cli
+          cd crates/bootkiln-gui
+          npx tauri build --no-bundle
 
-      - name: Build the CLI
-        run: cargo build --release --locked -p bootkiln-cli
-
-      - name: Collect files and checksums
+      - name: Collect
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/bootkiln-gui.exe dist/
           Copy-Item target/release/bootkiln.exe dist/
-          Get-ChildItem dist | ForEach-Object {
-            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-          } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  linux:
+    # The oldest supported Ubuntu: the AppImage runs on systems with this glibc or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev libayatana-appindicator3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/bootkiln-gui/package-lock.json
+
+      - name: Tests
+        working-directory: crates/bootkiln-gui
+        run: |
+          npm ci
+          npm run build
+          cargo test --locked
+
+      # The AppImage bundles the CLI as its privileged write helper, so build it first.
+      - name: Build
+        run: |
+          cargo build --release --locked -p bootkiln-cli
+          cd crates/bootkiln-gui
+          npx tauri build
+
+      - name: Collect
+        run: |
+          mkdir dist
+          cp target/release/bundle/appimage/*.AppImage "dist/bootkiln-${GITHUB_REF_NAME#v}-x86_64.AppImage"
+          cp target/release/bootkiln dist/bootkiln-linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
 
       - name: Release notes from CHANGELOG.md
-        shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
-          $lines = Get-Content CHANGELOG.md
-          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($version))\]").LineNumber
-          if (-not $start) { throw "CHANGELOG.md has no section for $version" }
-          $rest = $lines[$start..($lines.Count - 1)]
-          $end = ($rest | Select-String -Pattern '^## \[' | Select-Object -First 1).LineNumber
-          $section = if ($end) { $rest[0..($end - 2)] } else { $rest }
-          $section | Set-Content -Encoding utf8 notes.md
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "CHANGELOG.md has no section for $version" >&2; exit 1; fi
 
       - uses: softprops/action-gh-release@v2
         with:
           body_path: notes.md
-          files: |
-            dist/bootkiln-gui.exe
-            dist/bootkiln.exe
-            dist/SHA256SUMS.txt
+          files: dist/*

@@ -111,7 +111,7 @@ export const t = {
   doneButton: "Done",
 
   cancelledTitle: "Cancelled",
-  cancelledBody: "The drive is incomplete and will not boot. Write it again, or format it in Explorer to use it normally.",
+  cancelledBody: "The drive is incomplete and will not boot. Write it again, or format it to use it normally.",
   failedTitle: "Something went wrong",
   back: "Back",
 

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "title": "bootkiln",
+        "width": 520,
+        "height": 700,
+        "minWidth": 480,
+        "maxWidth": 680,
+        "minHeight": 560,
+        "resizable": true,
+        "center": true,
+        "dragDropEnabled": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["appimage"],
+    "category": "Utility",
+    "shortDescription": "Write bootable disk images to USB drives",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.png"],
+    "linux": {
+      "appimage": {
+        "files": {
+          "/usr/bin/bootkiln": "../../target/release/bootkiln"
+        }
+      }
+    }
+  }
+}

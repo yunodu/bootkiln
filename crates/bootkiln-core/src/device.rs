@@ -66,6 +66,11 @@ pub trait DiskBackend {
     /// Flush and unmount the volume mounted at `root`, so the next access reads the
     /// medium instead of cached data.
     fn dismount_volume(&self, root: &Path) -> io::Result<()>;
+    /// Done with the volume from [`Self::format_ntfs`]: unmount it where the backend mounted
+    /// it privately (Linux). Windows keeps it mounted under its drive letter.
+    fn release_volume(&self, _root: &Path) -> io::Result<()> {
+        Ok(())
+    }
     /// Safely remove `drive` (flush and power down the USB device), like Windows'
     /// "Safely Remove Hardware".
     fn eject(&self, drive: &Drive) -> io::Result<()>;

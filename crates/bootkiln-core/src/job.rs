@@ -161,6 +161,21 @@ pub enum Phase {
     VerifyingFiles,
 }
 
+impl Phase {
+    pub const ALL: [Phase; 5] = [Phase::Writing, Phase::Verifying, Phase::Formatting, Phase::Copying, Phase::VerifyingFiles];
+
+    /// Stable name used between processes and by the GUI.
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Writing => "writing",
+            Phase::Verifying => "verifying",
+            Phase::Formatting => "formatting",
+            Phase::Copying => "copying",
+            Phase::VerifyingFiles => "verifyingFiles",
+        }
+    }
+}
+
 /// After-write advice for the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Note {
@@ -171,6 +186,19 @@ pub enum Note {
     /// ISO mode on NTFS: UEFI boot through UEFI:NTFS, which needs Microsoft's third-party
     /// UEFI certificate trusted when Secure Boot is on.
     UefiNtfs,
+}
+
+impl Note {
+    pub const ALL: [Note; 3] = [Note::FormatPrompt, Note::UefiOnly, Note::UefiNtfs];
+
+    /// Stable name used between processes and by the GUI.
+    pub fn name(self) -> &'static str {
+        match self {
+            Note::FormatPrompt => "formatPrompt",
+            Note::UefiOnly => "uefiOnly",
+            Note::UefiNtfs => "uefiNtfs",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -207,12 +235,17 @@ impl Job {
                 progress(Phase::Formatting, 0, 0)?;
                 let root = backend.format_ntfs(drive, layout.ntfs_offset, &content.label)?;
                 let total = total_len(content.nodes());
-                copy_tree(image, content.nodes(), &root, &mut |n| progress(Phase::Copying, n, total))?;
-                backend.dismount_volume(&root)?;
-                if verify {
-                    verify_tree(image, content.nodes(), &root, &mut |n| progress(Phase::VerifyingFiles, n, total))?;
-                }
-                Ok(())
+                let result = (|| -> Result<(), Error> {
+                    copy_tree(image, content.nodes(), &root, &mut |n| progress(Phase::Copying, n, total))?;
+                    backend.dismount_volume(&root)?;
+                    if verify {
+                        verify_tree(image, content.nodes(), &root, &mut |n| progress(Phase::VerifyingFiles, n, total))?;
+                    }
+                    Ok(())
+                })();
+                // Also after failure or cancellation, so no private mount is left behind.
+                let released = backend.release_volume(&root).map_err(Error::from);
+                result.and(released)
             }
         }
     }

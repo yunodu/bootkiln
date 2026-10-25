@@ -49,9 +49,8 @@ pub fn catalog_entries() -> Vec<Entry> {
 /// Microsoft's name for this PC's language, for the Windows entry.
 #[tauri::command]
 pub fn default_windows_language() -> String {
-    bootkiln_platform::host_region()
-        .ok()
-        .and_then(|r| bootkiln_catalog::default_windows_language(&r.user_locale))
+    bootkiln_platform::host_locale()
+        .and_then(|l| bootkiln_catalog::default_windows_language(&l))
         .unwrap_or(bootkiln_catalog::WINDOWS_LANGUAGE_FALLBACK)
         .to_owned()
 }
