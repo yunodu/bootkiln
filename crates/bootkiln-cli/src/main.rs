@@ -1,22 +1,16 @@
 use std::fs::File;
-use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use bootkiln_core::copy::{copy_tree, total_len, verify_tree};
-use bootkiln_core::image::{self, ImageInfo, ImageKind};
-use bootkiln_core::iso_mode::{self, FileSystem, IsoContent};
-use bootkiln_core::uefi_ntfs::{self, NtfsLayout};
+use bootkiln_core::image;
+use bootkiln_core::iso_mode::{FileSystem, IsoContent};
+use bootkiln_core::job::{self, Analysis, Method, Note, Phase};
 use bootkiln_core::unattend::{self, Customisations};
-use bootkiln_core::{DiskBackend, Drive, Error, Plan, verify_plan, write_plan};
+use bootkiln_core::{DiskBackend, Drive, Plan, verify_plan};
 use bootkiln_platform::{NativeBackend, host_region};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-
-/// NTFS metadata (MFT, log, bitmaps) on top of the file data, as a fraction and a floor.
-const NTFS_OVERHEAD_PERCENT: u64 = 1;
-const NTFS_OVERHEAD_MIN: u64 = 64 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "bootkiln", version, about = "Write bootable disk images to USB drives")]
@@ -71,6 +65,16 @@ enum Mode {
     Iso,
     /// Raw byte-for-byte copy of the image
     Dd,
+}
+
+impl From<Mode> for job::Mode {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Auto => job::Mode::Auto,
+            Mode::Iso => job::Mode::Iso,
+            Mode::Dd => job::Mode::Dd,
+        }
+    }
 }
 
 /// Windows Setup customisations, written to `autounattend.xml` on the drive.
@@ -144,130 +148,81 @@ fn list(backend: &dyn DiskBackend) -> Result<()> {
     Ok(())
 }
 
-/// What `write` does to the drive.
-enum Job {
-    /// Raw device writes only: DD mode, or ISO mode on FAT32.
-    Device { plan: Plan, iso_mode: bool },
-    /// Partition table + UEFI:NTFS partition, then format and copy files.
-    Ntfs { layout: NtfsLayout, content: Box<IsoContent> },
-}
-
 fn write(backend: &dyn DiskBackend, args: &WriteArgs) -> Result<()> {
-    let WriteArgs { image: image_path, drive: drive_no, mode, yes, force, no_verify, windows } = args;
-    let (mode, force, verify) = (*mode, *force, !no_verify);
     require_elevated(backend)?;
-    let customisations = windows.customisations()?;
-    let (mut file, info) = open_image(image_path)?;
-    let drive = target_drive(backend, *drive_no)?;
-    if backend.disk_numbers_for_path(image_path).context("locating the image's disk")?.contains(&drive.number) {
-        bail!("the image is stored on drive {}; copy it elsewhere first", drive.number);
-    }
+    let customisations = args.windows.customisations()?;
+    let mut file = open(&args.image)?;
+    let drive = job::target_drive(backend, args.drive, &args.image)?;
 
-    println!("Image: {} ({})", image_path.display(), HumanBytes(info.len));
+    let mut analysis = job::analyze(&mut file, args.mode.into(), args.force)
+        .with_context(|| format!("reading {}", args.image.display()))?;
+    println!("Image: {} ({})", args.image.display(), HumanBytes(analysis.info.len));
     println!("Drive: {}", describe(&drive));
-    let content = match mode {
-        Mode::Dd => None,
-        Mode::Auto | Mode::Iso => Some(iso_mode::prepare(&mut file)),
-    };
-    let mut content = match (mode, content) {
-        (_, Some(Ok(content))) => Some(content),
-        (Mode::Iso, Some(Err(e))) => return Err(e).context("ISO mode is not possible for this image"),
-        (_, Some(Err(e))) => {
-            if !matches!(e, Error::NotIso9660) {
-                eprintln!("note: ISO mode is not possible ({e}); using DD mode");
-            }
-            None
-        }
-        (_, None) => None,
-    };
+    analysis.customise(&customisations)?;
+    print_method(&args.image, &analysis, !customisations.is_empty());
 
-    if !customisations.is_empty() {
-        let Some((content, windows)) = content.as_mut().and_then(|c| c.windows.map(|w| (c, w))) else {
-            bail!("the --win-* options need a Windows installer ISO written in ISO mode");
-        };
-        let answer_file = unattend::answer_file(&customisations, &windows)?;
-        content.add_root_file(unattend::FILE_NAME, answer_file.into_bytes());
-    }
-
-    let [volume_id, disk_signature] = random_ids();
-    let job = match content {
-        None => {
-            println!("Mode:  DD (raw copy of the image)");
-            Job::Device { plan: dd_plan(image_path, &info, &drive, force)?, iso_mode: false }
-        }
-        Some(content) => {
-            print_iso_mode(&content, !customisations.is_empty());
-            match content.file_system {
-                FileSystem::Fat32 => Job::Device {
-                    plan: content.fat32_plan(drive.size_bytes, drive.sector_size, volume_id, disk_signature)?,
-                    iso_mode: true,
-                },
-                FileSystem::Ntfs => {
-                    let layout = uefi_ntfs::layout(drive.size_bytes, drive.sector_size, disk_signature)?;
-                    let data = total_len(content.nodes());
-                    let needed = data + (data * NTFS_OVERHEAD_PERCENT / 100).max(NTFS_OVERHEAD_MIN);
-                    if needed > layout.ntfs_len {
-                        return Err(Error::DriveTooSmall { needed, available: layout.ntfs_len }.into());
-                    }
-                    Job::Ntfs { layout, content: Box::new(content) }
-                }
-            }
-        }
-    };
-    if !yes && !confirm(&drive)? {
+    let job = analysis.plan(&drive)?;
+    if !args.yes && !confirm(&drive)? {
         bail!("aborted");
     }
 
-    match &job {
-        Job::Device { plan, .. } => write_device(backend, &drive, &mut file, plan, verify)?,
-        Job::Ntfs { layout, content } => {
-            write_device(backend, &drive, &mut file, &layout.plan, verify)?;
-            let root = backend
-                .format_ntfs(&drive, layout.ntfs_offset, &content.label)
-                .with_context(|| format!("formatting {}", drive.path))?;
-            let len = total_len(content.nodes());
-            let bar = progress_bar(len, "Copying");
-            copy_tree(&mut file, content.nodes(), &root, &mut |n| bar.set_position(n))?;
-            bar.finish();
-            backend.dismount_volume(&root).context("flushing the NTFS volume")?;
-            if verify {
-                let bar = progress_bar(len, "Verifying");
-                verify_tree(&mut file, content.nodes(), &root, &mut |n| bar.set_position(n))?;
-                bar.finish();
+    let mut bar: Option<(Phase, ProgressBar)> = None;
+    job.run(&mut file, backend, &drive, !args.no_verify, &mut |phase, done, total| {
+        if bar.as_ref().is_none_or(|(p, _)| *p != phase) {
+            if let Some((_, old)) = bar.take() {
+                old.finish();
             }
+            bar = Some((phase, progress_bar(total, phase)));
         }
+        if let Some((_, bar)) = &bar {
+            bar.set_position(done);
+        }
+        Ok(())
+    })?;
+    if let Some((_, bar)) = bar {
+        bar.finish();
     }
 
     println!("Done. {} is ready.", drive.path);
-    match job {
-        Job::Device { iso_mode: false, .. } => println!(
-            "Note: Windows may say the drive needs to be formatted. That is expected for bootable images; \
-             choose Cancel, or the drive will be erased."
-        ),
-        Job::Device { iso_mode: true, .. } => {
-            println!("Note: the drive boots on UEFI PCs; no legacy BIOS boot loader is installed.")
+    println!(
+        "Note: {}",
+        match job.note() {
+            Note::FormatPrompt => {
+                "Windows may say the drive needs to be formatted. That is expected for bootable images; \
+                 choose Cancel, or the drive will be erased."
+            }
+            Note::UefiOnly => "the drive boots on UEFI PCs; no legacy BIOS boot loader is installed.",
+            Note::UefiNtfs => {
+                "the drive boots on UEFI PCs through UEFI:NTFS; no legacy BIOS boot loader is installed.\n\
+                 UEFI:NTFS is signed with Microsoft's third-party UEFI certificate: with Secure Boot on, PCs that \
+                 trust only Windows' own certificate need \"Allow Microsoft 3rd party UEFI CA\" enabled."
+            }
         }
-        Job::Ntfs { .. } => println!(
-            "Note: the drive boots on UEFI PCs through UEFI:NTFS; no legacy BIOS boot loader is installed.\n\
-             UEFI:NTFS is signed with Microsoft's third-party UEFI certificate: with Secure Boot on, PCs that \
-             trust only Windows' own certificate need \"Allow Microsoft 3rd party UEFI CA\" enabled."
-        ),
-    }
+    );
     Ok(())
 }
 
-/// Write `plan` to the raw drive and read it back.
-fn write_device(backend: &dyn DiskBackend, drive: &Drive, image: &mut File, plan: &Plan, verify: bool) -> Result<()> {
-    let mut device = backend.open_exclusive(drive).with_context(|| format!("opening {}", drive.path))?;
-    let bar = progress_bar(plan.len(), "Writing");
-    write_plan(image, plan, device.as_mut(), &mut |n| bar.set_position(n))?;
-    bar.finish();
-    if verify {
-        let bar = progress_bar(plan.len(), "Verifying");
-        verify_plan(image, plan, device.as_mut(), &mut |n| bar.set_position(n))?;
-        bar.finish();
+fn print_method(image_path: &Path, analysis: &Analysis, answer_file: bool) {
+    if let Some(reason) = &analysis.iso_unavailable {
+        eprintln!("note: ISO mode is not possible ({reason}); using DD mode");
     }
-    Ok(())
+    match &analysis.method {
+        Method::Dd { bios_only, forced } => {
+            println!("Mode:  DD (raw copy of the image)");
+            if *bios_only {
+                eprintln!(
+                    "warning: {} boots only via legacy BIOS (no GPT or EFI system partition).\n\
+                     UEFI PCs will not list the drive as bootable unless legacy boot (CSM) is enabled \
+                     and Secure Boot is off; many recent PCs have no CSM at all.",
+                    image_path.display()
+                );
+            }
+            if *forced {
+                eprintln!("warning: image is not raw-bootable; writing anyway (--force)");
+            }
+        }
+        Method::Iso(content) => print_iso_mode(content, answer_file),
+    }
 }
 
 fn print_iso_mode(content: &IsoContent, answer_file: bool) {
@@ -303,46 +258,17 @@ fn print_iso_mode(content: &IsoContent, answer_file: bool) {
     }
 }
 
-/// Raw copy, if the image looks raw-bootable (or `force`).
-fn dd_plan(image_path: &Path, info: &ImageInfo, drive: &Drive, force: bool) -> Result<Plan> {
-    match info.kind {
-        ImageKind::Hybrid => {}
-        ImageKind::BiosOnly => eprintln!(
-            "warning: {} boots only via legacy BIOS (no GPT or EFI system partition).\n\
-             UEFI PCs will not list the drive as bootable unless legacy boot (CSM) is enabled \
-             and Secure Boot is off; many recent PCs have no CSM at all.",
-            image_path.display()
-        ),
-        _ if force => eprintln!("warning: image is not raw-bootable; writing anyway (--force)"),
-        ImageKind::OpticalOnly => bail!(
-            "{} is an ISO 9660/UDF image without a boot record or UEFI boot loader.\n\
-             A raw copy will not boot from USB. Pass --force to write it anyway.",
-            image_path.display()
-        ),
-        ImageKind::Unknown => bail!(
-            "{} has neither a boot record nor an ISO 9660 descriptor; pass --force to write it anyway",
-            image_path.display()
-        ),
-    }
-    if info.len > drive.size_bytes {
-        bail!("image ({}) does not fit on drive {} ({})", HumanBytes(info.len), drive.number, HumanBytes(drive.size_bytes));
-    }
-    Ok(Plan::raw_image(info.len))
-}
-
-/// FAT volume ID and MBR disk signature; Windows needs the signature unique among disks.
-fn random_ids() -> [u32; 2] {
-    let random = RandomState::new().build_hasher().finish();
-    [random as u32, (random >> 32) as u32]
-}
-
 fn verify(backend: &dyn DiskBackend, image_path: &Path, drive_no: u32) -> Result<()> {
     require_elevated(backend)?;
-    let (mut file, info) = open_image(image_path)?;
-    let drive = target_drive(backend, drive_no)?;
+    let mut file = open(image_path)?;
+    let info = image::inspect(&mut file).with_context(|| format!("reading {}", image_path.display()))?;
+    let drive = job::target_drive(backend, drive_no, image_path)?;
     let mut device = backend.open_exclusive(&drive).with_context(|| format!("opening {}", drive.path))?;
-    let bar = progress_bar(info.len, "Verifying");
-    verify_plan(&mut file, &Plan::raw_image(info.len), device.as_mut(), &mut |n| bar.set_position(n))?;
+    let bar = progress_bar(info.len, Phase::Verifying);
+    verify_plan(&mut file, &Plan::raw_image(info.len), device.as_mut(), &mut |n| {
+        bar.set_position(n);
+        Ok(())
+    })?;
     bar.finish();
     println!("OK: {} matches {}", drive.path, image_path.display());
     Ok(())
@@ -355,27 +281,8 @@ fn require_elevated(backend: &dyn DiskBackend) -> Result<()> {
     Ok(())
 }
 
-fn open_image(path: &Path) -> Result<(File, ImageInfo)> {
-    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let info = image::inspect(&mut file).with_context(|| format!("reading {}", path.display()))?;
-    Ok((file, info))
-}
-
-/// Re-reads the drive list so the number refers to the drive as it is now.
-fn target_drive(backend: &dyn DiskBackend, number: u32) -> Result<Drive> {
-    let drive = backend
-        .list_drives()
-        .context("listing drives")?
-        .into_iter()
-        .find(|d| d.number == number)
-        .with_context(|| format!("no drive {number}; run `bootkiln list`"))?;
-    if drive.is_system {
-        bail!("drive {number} holds the running Windows installation; refusing to write it");
-    }
-    if !drive.is_safe_target() {
-        bail!("drive {number} ({}) is not a removable USB / SD drive; refusing to write it", drive.model);
-    }
-    Ok(drive)
+fn open(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("opening {}", path.display()))
 }
 
 fn describe(d: &Drive) -> String {
@@ -391,10 +298,16 @@ fn confirm(drive: &Drive) -> Result<bool> {
     Ok(line.trim() == drive.number.to_string())
 }
 
-fn progress_bar(len: u64, label: &'static str) -> ProgressBar {
+fn progress_bar(len: u64, phase: Phase) -> ProgressBar {
+    let label = match phase {
+        Phase::Writing => "Writing",
+        Phase::Verifying | Phase::VerifyingFiles => "Verifying",
+        Phase::Formatting => "Formatting",
+        Phase::Copying => "Copying",
+    };
     let bar = ProgressBar::new(len).with_message(label);
     bar.set_style(
-        ProgressStyle::with_template("{msg:>9} [{bar:40}] {bytes}/{total_bytes} {binary_bytes_per_sec} ETA {eta}")
+        ProgressStyle::with_template("{msg:>10} [{bar:40}] {bytes}/{total_bytes} {binary_bytes_per_sec} ETA {eta}")
             .expect("valid progress template")
             .progress_chars("=> "),
     );

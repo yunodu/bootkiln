@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::error::Error;
 use crate::fat32::{Node, NodeKind};
-use crate::plan::Source;
+use crate::plan::{Progress, Source};
 
 const CHUNK: usize = 4 * 1024 * 1024;
 
@@ -26,7 +26,7 @@ pub fn copy_tree<R: Read + Seek>(
     image: &mut R,
     nodes: &[Node],
     root: &Path,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut Progress,
 ) -> Result<(), Error> {
     let mut walker = Walker { image, buf: vec![0u8; CHUNK], other: Vec::new(), done: 0, progress };
     walker.copy(nodes, root, "")
@@ -37,22 +37,22 @@ pub fn verify_tree<R: Read + Seek>(
     image: &mut R,
     nodes: &[Node],
     root: &Path,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut Progress,
 ) -> Result<(), Error> {
     let mut walker = Walker { image, buf: vec![0u8; CHUNK], other: vec![0u8; CHUNK], done: 0, progress };
     walker.verify(nodes, root, "")
 }
 
-struct Walker<'a, R> {
+struct Walker<'a, 'p, R> {
     image: &'a mut R,
     buf: Vec<u8>,
     /// Second buffer for verification; empty when copying.
     other: Vec<u8>,
     done: u64,
-    progress: &'a mut dyn FnMut(u64),
+    progress: &'a mut Progress<'p>,
 }
 
-impl<R: Read + Seek> Walker<'_, R> {
+impl<R: Read + Seek> Walker<'_, '_, R> {
     fn copy(&mut self, nodes: &[Node], dir: &Path, path: &str) -> Result<(), Error> {
         for node in nodes {
             let target = dir.join(&node.name);
@@ -121,7 +121,7 @@ impl<R: Read + Seek> Walker<'_, R> {
             sink(chunk)?;
             consumed += n as u64;
             self.done += n as u64;
-            (self.progress)(self.done);
+            (self.progress)(self.done)?;
         }
         Ok(())
     }
@@ -167,23 +167,23 @@ mod tests {
         let nodes = tree();
 
         let mut last = 0;
-        copy_tree(&mut Cursor::new(&image), &nodes, &dir, &mut |n| last = n).unwrap();
+        copy_tree(&mut Cursor::new(&image), &nodes, &dir, &mut |n| { last = n; Ok(()) }).unwrap();
         assert_eq!(last, total_len(&nodes));
         let wim = fs::read(dir.join("sources/install.wim")).unwrap();
         assert_eq!(&wim[..5_000_000], &image[100..5_000_100]);
         assert_eq!(&wim[5_000_000..], b"\0\0\0\0\0\0\0\0\0\0tail");
         assert_eq!(fs::read(dir.join("empty")).unwrap(), b"");
-        verify_tree(&mut Cursor::new(&image), &nodes, &dir, &mut |_| {}).unwrap();
+        verify_tree(&mut Cursor::new(&image), &nodes, &dir, &mut |_| Ok(())).unwrap();
 
         let mut tampered = wim.clone();
         tampered[4_500_000] ^= 1;
         fs::write(dir.join("sources/install.wim"), &tampered).unwrap();
-        let err = verify_tree(&mut Cursor::new(&image), &nodes, &dir, &mut |_| {}).unwrap_err();
+        let err = verify_tree(&mut Cursor::new(&image), &nodes, &dir, &mut |_| Ok(())).unwrap_err();
         assert!(matches!(&err, Error::FileMismatch { path } if path == "/sources/install.wim"), "{err:?}");
 
         fs::write(dir.join("empty"), b"x").unwrap();
         fs::write(dir.join("sources/install.wim"), &wim).unwrap();
-        let err = verify_tree(&mut Cursor::new(&image), &nodes, &dir, &mut |_| {}).unwrap_err();
+        let err = verify_tree(&mut Cursor::new(&image), &nodes, &dir, &mut |_| Ok(())).unwrap_err();
         assert!(matches!(&err, Error::FileMismatch { path } if path == "/empty"), "{err:?}");
         fs::remove_dir_all(&dir).unwrap();
     }

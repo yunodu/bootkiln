@@ -4,13 +4,34 @@ Write bootable disk images to USB drives. Windows today; Linux planned.
 
 ## Status (v0.1)
 
+- `bootkiln-gui.exe` — desktop app (portable, single exe) for the same workflow; see [GUI](#gui).
 - `bootkiln list` — removable USB / SD drives (system disk and internal disks are never shown).
 - `bootkiln write <image> -d <N>` — write an ISO or disk image, then read-back verification. Two modes:
   - **ISO mode** — the drive gets the ISO's files, like Rufus's "ISO Image mode": on FAT32, or on NTFS plus a UEFI:NTFS boot partition when a file is 4 GiB or larger (e.g. Windows 11's `install.wim`). It boots on UEFI PCs and stays usable for other files. Linux ISOs and Windows 10 / 11 installer ISOs (x64, ARM64) are supported.
   - **DD mode** — byte-for-byte copy of the image (hybrid ISOs, raw `.img` disk images).
 - `bootkiln verify <image> -d <N>` — compare a drive written in DD mode with an image.
 
-Not yet: legacy BIOS boot in ISO mode, OS catalog / downloader, GUI.
+Not yet: legacy BIOS boot in ISO mode, OS catalog / downloader, translations.
+
+## GUI
+
+`bootkiln-gui.exe` is a [Tauri](https://tauri.app) app: the window is a Svelte + TypeScript UI in `crates/bootkiln-gui/ui`, the Rust side calls the same `bootkiln_core::job` workflow as the CLI. It asks for administrator rights at launch (UAC), follows the system's dark / light theme and uses the Windows 11 Mica backdrop.
+
+- **Drive** — removable drives, refreshed automatically when a drive is plugged in or out.
+- **Image** — file picker or drag and drop; shows how the image will be written and any warnings.
+- **Windows setup** — shown for Windows installer ISOs; the same answer-file options as the CLI's `--win-*` flags.
+- **Advanced** — write mode (Auto / ISO / DD) and read-back verification.
+- **Start** checks the write without touching the drive, then asks for confirmation. Progress shows the phase, speed and time left; **Cancel** stops within seconds and leaves the drive incomplete. After success, **Eject** safely removes the drive.
+
+Build (needs Node.js for the UI; the exe needs only WebView2, which ships with Windows 10 / 11):
+
+```
+cd crates\bootkiln-gui
+npm install
+npx tauri build --no-bundle
+```
+
+The exe is `target\release\bootkiln-gui.exe`. All UI text lives in `ui/src/lib/texts.ts`.
 
 ## Usage
 
@@ -69,6 +90,7 @@ After a DD write of a hybrid ISO, Windows usually reports the drive as unformatt
 | `bootkiln-core` | `Drive`, `DiskBackend` / `BlockDevice` traits, image inspection, ISO 9660 and UDF readers, FAT32 and UEFI:NTFS layouts, ISO mode, Windows detection and answer files, write + verify of a `Plan` (device runs), file-tree copy + verify |
 | `bootkiln-platform` | Native backends (`windows.rs`: `\\.\PhysicalDriveN`, volume lock / dismount, unbuffered I/O, NTFS formatting; `region.rs`: regional settings) |
 | `bootkiln-cli` | `bootkiln` command-line tool |
+| `bootkiln-gui` | `bootkiln-gui` desktop app (Tauri; UI in `ui/`) |
 
 ## Third-party components
 

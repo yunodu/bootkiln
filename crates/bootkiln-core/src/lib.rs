@@ -11,6 +11,7 @@ pub mod fat32;
 pub mod image;
 pub mod iso9660;
 pub mod iso_mode;
+pub mod job;
 pub mod mbr;
 pub mod plan;
 #[cfg(test)]

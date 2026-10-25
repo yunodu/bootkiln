@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "bootkiln",
+  "version": "0.1.0",
+  "identifier": "dev.bootkiln.desktop",
+  "build": {
+    "frontendDist": "ui/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "bootkiln",
+        "width": 520,
+        "height": 700,
+        "minWidth": 480,
+        "maxWidth": 680,
+        "minHeight": 560,
+        "resizable": true,
+        "center": true,
+        "transparent": true,
+        "windowEffects": { "effects": ["mica"] },
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"]
+  }
+}

@@ -2,3 +2,6 @@
 *.iso
 *.img
 !/crates/bootkiln-core/assets/uefi-ntfs.img
+/crates/bootkiln-gui/node_modules
+/crates/bootkiln-gui/ui/dist
+/crates/bootkiln-gui/gen

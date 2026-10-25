@@ -10,6 +10,10 @@ use crate::error::Error;
 /// Bytes moved per device I/O.
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
+/// Receives the bytes done so far; returning an error (e.g. [`Error::Cancelled`]) stops
+/// the operation.
+pub type Progress<'a> = dyn FnMut(u64) -> Result<(), Error> + 'a;
+
 /// Where a run of device bytes comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -86,7 +90,7 @@ pub fn write_plan<R: Read + Seek>(
     image: &mut R,
     plan: &Plan,
     device: &mut dyn BlockDevice,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut Progress,
 ) -> Result<(), Error> {
     let sector = check_device(plan, device)?;
     stream(image, plan, sector, progress, &mut |start, data, _| Ok(device.write_at(start, data)?))?;
@@ -99,7 +103,7 @@ pub fn verify_plan<R: Read + Seek>(
     image: &mut R,
     plan: &Plan,
     device: &mut dyn BlockDevice,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut Progress,
 ) -> Result<(), Error> {
     let sector = check_device(plan, device)?;
     let mut actual = AlignedBuffer::zeroed(CHUNK_SIZE);
@@ -133,7 +137,7 @@ fn stream<R: Read + Seek>(
     image: &mut R,
     plan: &Plan,
     sector: usize,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut Progress,
     flush: &mut Flush,
 ) -> Result<(), Error> {
     let mut buf = AlignedBuffer::zeroed(CHUNK_SIZE);
@@ -182,7 +186,7 @@ fn stream<R: Read + Seek>(
             filled += n;
             consumed += n as u64;
             done += n as u64;
-            progress(done);
+            progress(done)?;
         }
     }
     if filled > 0 {
@@ -211,7 +215,7 @@ mod tests {
         let plan = Plan::raw_image(len as u64);
         let mut disk = MemDisk::new(CHUNK_SIZE * 3, 4096);
         let mut last = 0;
-        write_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |p| last = p).unwrap();
+        write_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |p| { last = p; Ok(()) }).unwrap();
 
         assert_eq!(last, len as u64);
         assert!(disk.synced);
@@ -220,7 +224,7 @@ mod tests {
         assert!(disk.data[len..tail_end].iter().all(|&b| b == 0), "tail padded with zeros");
         assert!(disk.data[tail_end..].iter().all(|&b| b == 0xEE), "nothing written past the image");
 
-        verify_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| {}).unwrap();
+        verify_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| Ok(())).unwrap();
     }
 
     #[test]
@@ -234,7 +238,7 @@ mod tests {
             (16384, Source::Zeros(1024)),
         ]);
         let mut disk = MemDisk::new(32768, 512);
-        write_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| {}).unwrap();
+        write_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| Ok(())).unwrap();
 
         assert!(disk.data[..600].iter().all(|&b| b == 7));
         assert!(disk.data[600..1024].iter().all(|&b| b == 0), "partial sector padded");
@@ -244,9 +248,9 @@ mod tests {
         assert!(disk.data[16384..17408].iter().all(|&b| b == 0));
         assert!(disk.data[17408..].iter().all(|&b| b == 0xEE));
 
-        verify_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| {}).unwrap();
+        verify_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| Ok(())).unwrap();
         disk.data[11250] = 0;
-        let err = verify_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| {}).unwrap_err();
+        let err = verify_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| Ok(())).unwrap_err();
         assert!(matches!(err, Error::Mismatch { offset: 11250 }), "{err:?}");
     }
 
@@ -255,11 +259,11 @@ mod tests {
         let img = pattern(CHUNK_SIZE + 512);
         let plan = Plan::raw_image(img.len() as u64);
         let mut disk = MemDisk::new(CHUNK_SIZE * 2, 512);
-        write_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| {}).unwrap();
+        write_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| Ok(())).unwrap();
         let bad = CHUNK_SIZE + 17;
         disk.data[bad] ^= 0xFF;
 
-        let err = verify_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| {}).unwrap_err();
+        let err = verify_plan(&mut Cursor::new(&img), &plan, &mut disk, &mut |_| Ok(())).unwrap_err();
         assert!(matches!(err, Error::Mismatch { offset } if offset == bad as u64), "{err:?}");
     }
 
@@ -267,7 +271,7 @@ mod tests {
     fn rejects_plan_larger_than_device_before_writing() {
         let img = pattern(8192);
         let mut disk = MemDisk::new(4096, 512);
-        let err = write_plan(&mut Cursor::new(&img), &Plan::raw_image(8192), &mut disk, &mut |_| {}).unwrap_err();
+        let err = write_plan(&mut Cursor::new(&img), &Plan::raw_image(8192), &mut disk, &mut |_| Ok(())).unwrap_err();
         assert!(matches!(err, Error::ImageTooLarge { image: 8192, device: 4096 }), "{err:?}");
         assert!(disk.data.iter().all(|&b| b == 0xEE));
     }
@@ -276,7 +280,7 @@ mod tests {
     fn image_shorter_than_plan_is_reported() {
         let img = pattern(1000);
         let mut disk = MemDisk::new(CHUNK_SIZE, 512);
-        let err = write_plan(&mut Cursor::new(&img), &Plan::raw_image(2000), &mut disk, &mut |_| {}).unwrap_err();
+        let err = write_plan(&mut Cursor::new(&img), &Plan::raw_image(2000), &mut disk, &mut |_| Ok(())).unwrap_err();
         assert!(matches!(err, Error::ImageTruncated { offset: 0 }), "{err:?}");
     }
 
@@ -284,7 +288,19 @@ mod tests {
     fn unaligned_run_after_gap_is_rejected() {
         let plan = Plan::new(vec![(0, Source::Bytes(vec![1; 10])), (700, Source::Bytes(vec![2; 10]))]);
         let mut disk = MemDisk::new(4096, 512);
-        let err = write_plan(&mut Cursor::new(Vec::new()), &plan, &mut disk, &mut |_| {}).unwrap_err();
+        let err = write_plan(&mut Cursor::new(Vec::new()), &plan, &mut disk, &mut |_| Ok(())).unwrap_err();
         assert!(matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::InvalidInput), "{err:?}");
+    }
+
+    #[test]
+    fn progress_error_stops_the_write() {
+        let img = pattern(CHUNK_SIZE * 3);
+        let mut disk = MemDisk::new(CHUNK_SIZE * 3, 512);
+        let err = write_plan(&mut Cursor::new(&img), &Plan::raw_image(img.len() as u64), &mut disk, &mut |done| {
+            if done >= CHUNK_SIZE as u64 { Err(Error::Cancelled) } else { Ok(()) }
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(disk.data[CHUNK_SIZE..].iter().all(|&b| b == 0xEE), "nothing written after cancelling");
     }
 }

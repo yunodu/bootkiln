@@ -1,0 +1,21 @@
+[package]
+name = "bootkiln-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bootkiln-gui"
+path = "src/main.rs"
+# The embedded manifest requires administrator rights, so a test harness could not start.
+test = false
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+bootkiln-core = { path = "../bootkiln-core" }
+bootkiln-platform = { path = "../bootkiln-platform" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2.12", features = [] }
+tauri-plugin-dialog = "2.8"

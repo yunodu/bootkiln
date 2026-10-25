@@ -342,7 +342,7 @@ mod tests {
         let content = prepare(&mut Cursor::new(iso)).unwrap();
         let plan = content.fat32_plan(DISK as u64, 512, 0x1234_5678, 0xCAFE_F00D).unwrap();
         let mut disk = MemDisk::new(DISK, 512);
-        write_plan(&mut Cursor::new(iso), &plan, &mut disk, &mut |_| {}).unwrap();
+        write_plan(&mut Cursor::new(iso), &plan, &mut disk, &mut |_| Ok(())).unwrap();
         (content, disk)
     }
 

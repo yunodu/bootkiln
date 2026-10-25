@@ -8,7 +8,7 @@ mod windows;
 #[cfg(windows)]
 pub use region::host_region;
 #[cfg(windows)]
-pub use windows::WindowsBackend as NativeBackend;
+pub use windows::{WindowsBackend as NativeBackend, windows_build};
 
 #[cfg(not(windows))]
 compile_error!("bootkiln currently supports only Windows; the Linux backend is planned");

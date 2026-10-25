@@ -555,7 +555,7 @@ mod tests {
     fn mount(root: &[Node], disk_size: usize, sector: u32) -> (MemDisk, FileSystem<Cursor<Vec<u8>>>) {
         let plan = layout(root, &volume(), disk_size as u64, sector).unwrap();
         let mut disk = MemDisk::new(disk_size, sector);
-        write_plan(&mut Cursor::new(Vec::new()), &plan, &mut disk, &mut |_| {}).unwrap();
+        write_plan(&mut Cursor::new(Vec::new()), &plan, &mut disk, &mut |_| Ok(())).unwrap();
         let partition = disk.data[MIB as usize..].to_vec();
         let fs = FileSystem::new(Cursor::new(partition), FsOptions::new()).unwrap();
         (disk, fs)
@@ -647,7 +647,7 @@ mod tests {
         let size = 40 * MIB as usize;
         let plan = layout(&[], &volume(), size as u64, 512).unwrap();
         let mut disk = MemDisk::new(size, 512);
-        write_plan(&mut Cursor::new(Vec::new()), &plan, &mut disk, &mut |_| {}).unwrap();
+        write_plan(&mut Cursor::new(Vec::new()), &plan, &mut disk, &mut |_| Ok(())).unwrap();
         assert!(disk.data[512..1024].iter().all(|&b| b == 0), "primary GPT header");
         assert!(disk.data[size - 512..].iter().all(|&b| b == 0), "backup GPT header");
     }

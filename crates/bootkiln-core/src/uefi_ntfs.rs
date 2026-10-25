@@ -86,7 +86,7 @@ mod tests {
         let size = 300 * 1024 * 1024 + 512 * 7;
         let layout = layout(size as u64, 512, 0xABCD).unwrap();
         let mut disk = MemDisk::new(size, 512);
-        write_plan(&mut Cursor::new(Vec::new()), &layout.plan, &mut disk, &mut |_| {}).unwrap();
+        write_plan(&mut Cursor::new(Vec::new()), &layout.plan, &mut disk, &mut |_| Ok(())).unwrap();
 
         let esp_offset = 299 * 1024 * 1024;
         assert_eq!(layout.ntfs_offset, 1024 * 1024);

@@ -11,6 +11,12 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use bootkiln_core::{BlockDevice, BusKind, DiskBackend, Drive};
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Get_Parent, CM_Request_Device_EjectW, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO,
+    PNP_VETO_TYPE, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInterfaceDetailW,
+};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, GENERIC_READ, GENERIC_WRITE, HANDLE,
     INVALID_HANDLE_VALUE, MAX_PATH,
@@ -25,12 +31,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
 use windows_sys::Win32::System::Ioctl::{
-    DISK_EXTENT, DISK_GEOMETRY, DISK_GEOMETRY_EX, FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME,
-    IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_UPDATE_PROPERTIES, IOCTL_STORAGE_QUERY_PROPERTY,
-    PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
-    VOLUME_DISK_EXTENTS,
+    DISK_EXTENT, DISK_GEOMETRY, DISK_GEOMETRY_EX, FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, GUID_DEVINTERFACE_DISK,
+    IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_UPDATE_PROPERTIES, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+    IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_DEVICE_NUMBER,
+    STORAGE_PROPERTY_QUERY, StorageDeviceProperty, VOLUME_DISK_EXTENTS,
 };
-use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+use windows_sys::Win32::System::SystemInformation::{GetSystemWindowsDirectoryW, GetVersionExW, OSVERSIONINFOW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// Highest `PhysicalDriveN` probed; numbers can have gaps.
@@ -175,6 +181,90 @@ impl DiskBackend for WindowsBackend {
         ioctl(&handle, FSCTL_DISMOUNT_VOLUME, &[], &mut [])?;
         // Dropping the handle unlocks the volume; Windows remounts it on next access.
         Ok(())
+    }
+
+    fn eject(&self, drive: &Drive) -> io::Result<()> {
+        let disk = disk_device_instance(drive.number)?;
+        // The disk's parent is the USB mass-storage (or card reader) device that gets removed.
+        let mut parent = 0u32;
+        // SAFETY: valid out-pointer.
+        if unsafe { CM_Get_Parent(&mut parent, disk, 0) } != CR_SUCCESS {
+            return Err(io::Error::other(format!("no parent device for {}", drive.path)));
+        }
+        let mut veto: PNP_VETO_TYPE = 0;
+        let mut veto_name = [0u16; MAX_PATH as usize];
+        // SAFETY: out-pointers valid; name buffer length matches.
+        let result = unsafe { CM_Request_Device_EjectW(parent, &mut veto, veto_name.as_mut_ptr(), MAX_PATH, 0) };
+        if result != CR_SUCCESS || veto != 0 {
+            let by = from_wide(&veto_name);
+            return Err(io::Error::other(format!(
+                "Windows refused to eject {} (veto {veto}{}); close programs using it and try again",
+                drive.path,
+                if by.is_empty() { String::new() } else { format!(" by {by}") }
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Windows build number (22000 and later is Windows 11).
+pub fn windows_build() -> Option<u32> {
+    let mut info = OSVERSIONINFOW { dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32, ..Default::default() };
+    // SAFETY: size field set; the manifest declares Windows 10 support, so the real build is reported.
+    (unsafe { GetVersionExW(&mut info) } != 0).then_some(info.dwBuildNumber)
+}
+
+/// Device instance of `\\.\PhysicalDrive<number>`, found among the present disk interfaces.
+fn disk_device_instance(number: u32) -> io::Result<u32> {
+    // SAFETY: valid class GUID; no enumerator filter or parent window.
+    let set: HDEVINFO =
+        unsafe { SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK, null(), null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE) };
+    if set == INVALID_HANDLE_VALUE as HDEVINFO {
+        return Err(io::Error::last_os_error());
+    }
+    let _set = DeviceInfoSet(set);
+    for index in 0.. {
+        let mut interface = SP_DEVICE_INTERFACE_DATA { cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32, ..Default::default() };
+        // SAFETY: interface.cbSize set; set is a valid device information set.
+        if unsafe { SetupDiEnumDeviceInterfaces(set, null(), &GUID_DEVINTERFACE_DISK, index, &mut interface) } == 0 {
+            break;
+        }
+        let mut needed = 0u32;
+        // SAFETY: size query with no output buffer.
+        unsafe { SetupDiGetDeviceInterfaceDetailW(set, &interface, null_mut(), 0, &mut needed, null_mut()) };
+        // u64 storage keeps the detail struct 8-byte aligned.
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        let detail = buf.as_mut_ptr().cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+        let mut info = SP_DEVINFO_DATA { cbSize: size_of::<SP_DEVINFO_DATA>() as u32, ..Default::default() };
+        // SAFETY: detail points to `needed` writable, aligned bytes with cbSize set as required.
+        let ok = unsafe {
+            (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            SetupDiGetDeviceInterfaceDetailW(set, &interface, detail, needed, null_mut(), &mut info)
+        };
+        if ok == 0 {
+            continue;
+        }
+        let path_units = (needed as usize - offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath)) / 2;
+        // SAFETY: DevicePath is a NUL-terminated string inside `buf`.
+        let path = unsafe { std::slice::from_raw_parts((&raw const (*detail).DevicePath).cast::<u16>(), path_units) };
+        let Ok(handle) = Handle::open(&from_wide(path), 0, 0) else { continue };
+        let mut out = IoBuf::new();
+        let Ok(len) = ioctl(&handle, IOCTL_STORAGE_GET_DEVICE_NUMBER, &[], &mut out.0) else { continue };
+        if len >= size_of::<STORAGE_DEVICE_NUMBER>()
+            && field::<u32>(&out.0, offset_of!(STORAGE_DEVICE_NUMBER, DeviceNumber))? == number
+        {
+            return Ok(info.DevInst);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, format!(r"no device for \\.\PhysicalDrive{number}")))
+}
+
+struct DeviceInfoSet(HDEVINFO);
+
+impl Drop for DeviceInfoSet {
+    fn drop(&mut self) {
+        // SAFETY: we own the set.
+        unsafe { SetupDiDestroyDeviceInfoList(self.0) };
     }
 }
 
