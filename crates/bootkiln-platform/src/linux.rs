@@ -55,8 +55,9 @@ impl DiskBackend for LinuxBackend {
         for entry in fs::read_dir(SYS_BLOCK)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
             let dir = Path::new(SYS_BLOCK).join(&name);
-            // Loop, RAM, device-mapper and other virtual devices have no `device`; `sr` are optical drives.
-            if !dir.join("device").exists() || name.starts_with("sr") {
+            // Loop, RAM, device-mapper and other virtual devices have no `device`; `sr` are
+            // optical drives, `fd` legacy floppies.
+            if !dir.join("device").exists() || name.starts_with("sr") || name.starts_with("fd") {
                 continue;
             }
             let Ok(sectors) = read_u64(&dir.join("size")) else { continue };
@@ -121,7 +122,7 @@ impl DiskBackend for LinuxBackend {
 
     fn format_ntfs(&self, drive: &Drive, partition_offset: u64, label: &str) -> io::Result<PathBuf> {
         let name = disk_name(drive)?;
-        let partition = wait_for_partition(name, partition_offset)?;
+        let partition = wait_for_partition(drive, name, partition_offset)?;
         let start_sector = (partition_offset / u64::from(drive.sector_size)).to_string();
         let sector_size = drive.sector_size.to_string();
         run(
@@ -143,7 +144,10 @@ impl DiskBackend for LinuxBackend {
         )?;
         let root = Path::new(MOUNT_BASE).join(drive.number.to_string());
         fs::create_dir_all(&root)?;
-        mount_ntfs(&partition, &root)?;
+        if let Err(e) = mount_ntfs(&partition, &root) {
+            let _ = fs::remove_dir(&root);
+            return Err(e);
+        }
         Ok(root)
     }
 
@@ -402,33 +406,81 @@ fn mounted_device(point: &Path) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other(format!("nothing is mounted at {}", point.display())))
 }
 
-/// `/dev/<partition>` of disk `name` starting at byte `offset`, once the kernel lists it.
-fn wait_for_partition(name: &str, offset: u64) -> io::Result<PathBuf> {
+/// `/dev/<partition>` of disk `name` starting at byte `offset`, once the kernel's view
+/// matches the MBR just written. The old table may still be loaded (with a partition at
+/// the same start but another size) when a re-read was refused because udev was probing,
+/// and udev may re-read the table itself after our writes: formatting a stale partition
+/// node would lose the writes when the table changes underneath.
+fn wait_for_partition(drive: &Drive, name: &str, offset: u64) -> io::Result<PathBuf> {
+    let expected = mbr_partition_len(drive, offset)?;
     let dir = Path::new(SYS_BLOCK).join(name);
-    for _ in 0..PARTITION_POLLS {
+    for attempt in 0..PARTITION_POLLS {
+        settle_udev();
         for entry in fs::read_dir(&dir)?.flatten() {
             let part = entry.path();
-            // sysfs reports partition starts in 512-byte units whatever the sector size.
-            if part.join("partition").exists() && read_u64(&part.join("start")).is_ok_and(|s| s * 512 == offset) {
-                let node = Path::new("/dev").join(entry.file_name());
-                if node.exists() {
-                    return Ok(node);
-                }
+            // sysfs reports partition starts and sizes in 512-byte units whatever the sector size.
+            let matches = part.join("partition").exists()
+                && read_u64(&part.join("start")).is_ok_and(|s| s * 512 == offset)
+                && read_u64(&part.join("size")).is_ok_and(|s| s * 512 == expected);
+            let node = Path::new("/dev").join(entry.file_name());
+            if matches && node.exists() {
+                return Ok(node);
             }
+        }
+        if attempt % 4 == 3 {
+            reread_partitions(&drive.path);
         }
         thread::sleep(POLL_DELAY);
     }
     Err(io::Error::other(format!("the new NTFS partition on /dev/{name} did not appear")))
 }
 
-/// Mount with the kernel's ntfs3 driver, or ntfs-3g where the kernel lacks it.
-fn mount_ntfs(device: &Path, point: &Path) -> io::Result<()> {
-    let ntfs3 = run(Command::new("mount").args(["-t", "ntfs3"]).arg(device), point, "mounting NTFS (ntfs3)");
-    if ntfs3.is_ok() {
-        return Ok(());
+/// Length in bytes of the MBR partition starting at byte `offset` of `drive`, read from the
+/// disk itself.
+fn mbr_partition_len(drive: &Drive, offset: u64) -> io::Result<u64> {
+    let mut mbr = [0u8; 512];
+    File::open(&drive.path)?.read_exact_at(&mut mbr, 0)?;
+    let sector = u64::from(drive.sector_size);
+    (0..4)
+        .map(|i| &mbr[446 + 16 * i..446 + 16 * (i + 1)])
+        .find(|e| u64::from(u32::from_le_bytes(e[8..12].try_into().expect("4 bytes"))) * sector == offset)
+        .map(|e| u64::from(u32::from_le_bytes(e[12..16].try_into().expect("4 bytes"))) * sector)
+        .ok_or_else(|| io::Error::other(format!("{} has no partition at byte {offset}", drive.path)))
+}
+
+/// Wait for udev to finish probing the new partitions (it may re-read the table meanwhile).
+fn settle_udev() {
+    let _ = Command::new("udevadm").args(["settle", "--timeout=10"]).output();
+}
+
+/// Ask the kernel to re-read the partition table; refused (EBUSY) while a partition is in use.
+fn reread_partitions(path: &str) {
+    if let Ok(file) = File::open(path) {
+        // SAFETY: valid open descriptor; BLKRRPART takes no argument.
+        unsafe { libc::ioctl(file.as_raw_fd(), BLKRRPART, 0) };
     }
-    run(Command::new("mount").args(["-t", "ntfs-3g"]).arg(device), point, "mounting NTFS (ntfs-3g)")
-        .map_err(|e| io::Error::new(e.kind(), format!("{e}; earlier: {}", ntfs3.unwrap_err())))
+}
+
+/// Mount with the kernel's ntfs3 driver, or ntfs-3g where the kernel lacks it. Retried:
+/// udev probes a freshly formatted partition and holds it open meanwhile (EBUSY).
+fn mount_ntfs(device: &Path, point: &Path) -> io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        settle_udev();
+        let ntfs3 = run(Command::new("mount").args(["-t", "ntfs3"]).arg(device), point, "mounting NTFS (ntfs3)");
+        if ntfs3.is_ok() {
+            return Ok(());
+        }
+        let ntfs_3g = run(Command::new("mount").args(["-t", "ntfs-3g"]).arg(device), point, "mounting NTFS (ntfs-3g)");
+        match ntfs_3g {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt + 1 < OPEN_ATTEMPTS => {
+                attempt += 1;
+                thread::sleep(POLL_DELAY * 2);
+            }
+            Err(e) => return Err(io::Error::new(e.kind(), format!("{e}; with ntfs3: {}", ntfs3.unwrap_err()))),
+        }
+    }
 }
 
 /// Run `command` with `last` appended as its final argument; `what` names it in errors.
