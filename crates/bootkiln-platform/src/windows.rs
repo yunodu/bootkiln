@@ -4,7 +4,8 @@ use std::ffi::c_void;
 use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::thread::sleep;
 use std::time::Duration;
@@ -36,6 +37,9 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 const MAX_DISKS: u32 = 64;
 const LOCK_ATTEMPTS: u32 = 20;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// How long `format_ntfs` waits for Windows to list a just-written partition.
+const PARTITION_POLLS: u32 = 40;
+const PARTITION_POLL_MS: u32 = 250;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsBackend;
@@ -128,6 +132,49 @@ impl DiskBackend for WindowsBackend {
             )));
         }
         Ok(Box::new(WinDisk { disk, size, sector, _locks: locks }))
+    }
+
+    fn format_ntfs(&self, drive: &Drive, partition_offset: u64, label: &str) -> io::Result<PathBuf> {
+        // The Storage Management API formats volumes of any size (unlike format.com's FAT
+        // limits) and waits for Windows to notice the new partition table.
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'\n\
+             $p = $null\n\
+             for ($i = 0; $i -lt {PARTITION_POLLS} -and -not $p; $i++) {{\n\
+                 Update-HostStorageCache\n\
+                 $p = Get-Partition -DiskNumber {disk} -ErrorAction SilentlyContinue | Where-Object Offset -eq {partition_offset}\n\
+                 if (-not $p) {{ Start-Sleep -Milliseconds {PARTITION_POLL_MS} }}\n\
+             }}\n\
+             if (-not $p) {{ throw 'the new NTFS partition did not appear' }}\n\
+             $v = $p | Format-Volume -FileSystem NTFS -NewFileSystemLabel '{label}' -Force -Confirm:$false\n\
+             $v.Path",
+            disk = drive.number,
+            label = label.replace('\'', "''"),
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let path = stdout.lines().map(str::trim).rfind(|l| l.starts_with(r"\\?\Volume{"));
+        match path {
+            Some(path) if output.status.success() => Ok(PathBuf::from(path)),
+            _ => Err(io::Error::other(format!(
+                "formatting {} as NTFS failed: {}",
+                drive.path,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
+    }
+
+    fn dismount_volume(&self, root: &Path) -> io::Result<()> {
+        let volume = root.to_string_lossy();
+        let handle = Handle::open(volume.trim_end_matches('\\'), GENERIC_READ | GENERIC_WRITE, 0)?;
+        // SAFETY: valid open handle.
+        win(unsafe { FlushFileBuffers(handle.0) })?;
+        lock_volume(&handle)?;
+        ioctl(&handle, FSCTL_DISMOUNT_VOLUME, &[], &mut [])?;
+        // Dropping the handle unlocks the volume; Windows remounts it on next access.
+        Ok(())
     }
 }
 

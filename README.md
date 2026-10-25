@@ -6,11 +6,11 @@ Write bootable disk images to USB drives. Windows today; Linux planned.
 
 - `bootkiln list` — removable USB / SD drives (system disk and internal disks are never shown).
 - `bootkiln write <image> -d <N>` — write an ISO or disk image, then read-back verification. Two modes:
-  - **ISO mode** — the drive gets one FAT32 partition holding the ISO's files, like Rufus's "ISO Image mode". It boots on UEFI PCs (Secure Boot works if the ISO's loader is signed) and stays usable for other files.
+  - **ISO mode** — the drive gets the ISO's files, like Rufus's "ISO Image mode": on FAT32, or on NTFS plus a UEFI:NTFS boot partition when a file is 4 GiB or larger (e.g. Windows 11's `install.wim`). It boots on UEFI PCs and stays usable for other files. Linux ISOs and Windows 10 / 11 installer ISOs (x64, ARM64) are supported.
   - **DD mode** — byte-for-byte copy of the image (hybrid ISOs, raw `.img` disk images).
 - `bootkiln verify <image> -d <N>` — compare a drive written in DD mode with an image.
 
-Not yet: Windows installer ISOs (UDF, `install.wim` over 4 GiB), legacy BIOS boot in ISO mode, OS catalog / downloader, GUI.
+Not yet: legacy BIOS boot in ISO mode, OS catalog / downloader, GUI.
 
 ## Usage
 
@@ -20,18 +20,33 @@ Writing and verifying need an elevated (Administrator) terminal.
 cargo build --release
 target\release\bootkiln list
 target\release\bootkiln write Fedora-KDE-Desktop-Live-44-1.7.x86_64.iso -d 3
+target\release\bootkiln write Win11_x64_en-us.iso -d 3 --win-skip-hw-checks --win-local-account pat
 ```
 
 `write` asks you to type the drive number before erasing. Flags: `--mode auto|iso|dd` (default `auto`), `--yes` skips the prompt, `--no-verify` skips read-back, `--force` writes images that do not look raw-bootable in DD mode.
 
-`--mode auto` uses ISO mode for ISO 9660 images that contain a UEFI boot loader (`\EFI\BOOT\BOOT*.EFI`) and DD mode for everything else, or when ISO mode is impossible (e.g. a file of 4 GiB or more, which FAT32 cannot store).
+`--mode auto` uses ISO mode for ISO images (ISO 9660 or UDF) that contain a UEFI boot loader (`\EFI\BOOT\BOOT*.EFI`) and DD mode for everything else, or when ISO mode is impossible.
 
 ### ISO mode
 
-- Partition table: MBR, one active FAT32 (LBA) partition from 1 MiB to the end of the drive. Stale GPT headers at both ends of the drive are zeroed.
-- File names come from Rock Ridge, else Joliet, else plain ISO 9660. Symbolic links are skipped. Files whose names differ only in case are kept once if identical; otherwise the write is refused.
-- Live systems find their boot medium by filesystem label, and a FAT label is at most 11 upper-case characters. The FAT label is derived from the ISO label (`Fedora-KDE-Live-44` becomes `FEDORA-KDE-`), and `.cfg` / `.conf` files naming the ISO label are rewritten to the FAT label (`root=live:CDLABEL=Fedora-KDE-Live-44` becomes `root=live:LABEL=FEDORA-KDE-`). `write` lists the files it rewrote.
+- Files come from UDF when the image has it (Windows installers), else ISO 9660 with Rock Ridge, Joliet or plain names. Symbolic links are skipped. Files whose names differ only in case are kept once if identical; otherwise the write is refused.
+- **FAT32** (all files below 4 GiB): MBR, one active FAT32 (LBA) partition from 1 MiB to the end of the drive, built and verified sector by sector. Stale GPT headers at both ends of the drive are zeroed.
+- **NTFS** (a file of 4 GiB or more): MBR with an active NTFS partition from 1 MiB and a 1 MiB EFI system partition holding [UEFI:NTFS](https://github.com/pbatard/uefi-ntfs) at the end of the drive. UEFI firmware boots UEFI:NTFS, which loads an NTFS driver and starts `\EFI\BOOT\BOOT*.EFI` from the NTFS partition. Windows formats the NTFS partition; the files are copied through the file system, then the volume is dismounted and every file is read back and compared with the ISO. UEFI:NTFS is signed with Microsoft's third-party UEFI certificate, so Secure Boot stays on; PCs that trust only Windows' own certificate (some Secured-core PCs) need "Allow Microsoft 3rd party UEFI CA" enabled in the firmware. Only 512-byte-sector drives are supported, as the UEFI:NTFS image is built for them.
+- Live systems find their boot medium by filesystem label. The drive's label is derived from the ISO label: on FAT32 at most 11 upper-case characters (`Fedora-KDE-Live-44` becomes `FEDORA-KDE-`), on NTFS the ISO label up to 32 characters. `.cfg` / `.conf` files naming the ISO label are rewritten to the drive label (`root=live:CDLABEL=Fedora-KDE-Live-44` becomes `root=live:LABEL=FEDORA-KDE-`). `write` lists the files it rewrote.
 - No legacy BIOS boot loader is installed; the MBR boot code just hands over to the next boot device.
+
+### Windows installer options
+
+These add an `autounattend.xml` answer file to the drive root; each is off unless given, and they are refused for non-Windows images.
+
+| Flag | Effect |
+|---|---|
+| `--win-skip-hw-checks` | Skip the TPM 2.0, Secure Boot and 4 GB RAM checks (Windows 11 only; refused for Windows 10) |
+| `--win-skip-online-account` | Allow setup without a Microsoft account |
+| `--win-local-account <NAME>` | Create a local administrator with an empty password, which must be changed at first sign-in |
+| `--win-copy-region` | Use this PC's region, keyboard layout and time zone |
+| `--win-skip-privacy` | Answer the privacy questions with the most private choices and skip them |
+| `--win-no-bitlocker` | Turn off BitLocker's automatic device encryption |
 
 ### DD mode
 
@@ -45,11 +60,16 @@ After a DD write of a hybrid ISO, Windows usually reports the drive as unformatt
 - The disk holding the running Windows installation is always refused.
 - The disk holding the image file is refused.
 - The drive is re-read right before writing; a size or sector-size change aborts.
+- NTFS mode formats only the partition at the offset bootkiln just wrote to the target disk's partition table.
 
 ## Layout
 
 | Crate | Role |
 |---|---|
-| `bootkiln-core` | `Drive`, `DiskBackend` / `BlockDevice` traits, image inspection, ISO 9660 reader, FAT32 layout, ISO mode, write + verify of a `Plan` (device runs) |
-| `bootkiln-platform` | Native backends (`windows.rs`: `\\.\PhysicalDriveN`, volume lock / dismount, unbuffered I/O) |
+| `bootkiln-core` | `Drive`, `DiskBackend` / `BlockDevice` traits, image inspection, ISO 9660 and UDF readers, FAT32 and UEFI:NTFS layouts, ISO mode, Windows detection and answer files, write + verify of a `Plan` (device runs), file-tree copy + verify |
+| `bootkiln-platform` | Native backends (`windows.rs`: `\\.\PhysicalDriveN`, volume lock / dismount, unbuffered I/O, NTFS formatting; `region.rs`: regional settings) |
 | `bootkiln-cli` | `bootkiln` command-line tool |
+
+## Third-party components
+
+`crates/bootkiln-core/assets/uefi-ntfs.img` is UEFI:NTFS from Rufus, licensed under the GPL (v2 or later, and v3 or later for some drivers). It is embedded in the `bootkiln` binary and written unmodified to NTFS drives. Provenance, licenses and source links: [`crates/bootkiln-core/assets/README.md`](crates/bootkiln-core/assets/README.md).

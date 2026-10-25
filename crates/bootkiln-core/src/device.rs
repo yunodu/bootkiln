@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Bus a physical drive is attached through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,4 +59,11 @@ pub trait DiskBackend {
     /// Unmount every volume on `drive` and open it for raw read/write.
     /// Volumes stay locked until the returned device is dropped.
     fn open_exclusive(&self, drive: &Drive) -> io::Result<Box<dyn BlockDevice>>;
+    /// Format the partition starting at byte `partition_offset` of `drive` as NTFS with
+    /// `label`, after a partition table naming it was written with [`Self::open_exclusive`].
+    /// Returns a path to the mounted volume's root.
+    fn format_ntfs(&self, drive: &Drive, partition_offset: u64, label: &str) -> io::Result<PathBuf>;
+    /// Flush and unmount the volume mounted at `root`, so the next access reads the
+    /// medium instead of cached data.
+    fn dismount_volume(&self, root: &Path) -> io::Result<()>;
 }

@@ -240,3 +240,229 @@ fn iso_record(name: &[u8], lba: usize, size: usize, flags: u8, su: &[u8]) -> Vec
     r[0] = r.len() as u8;
     r
 }
+
+/// How a test UDF file entry stores its data.
+#[derive(Clone, Copy, Default)]
+pub struct UdfFileOpts {
+    /// Extended file entry (tag 266) instead of a file entry (tag 261).
+    pub extended: bool,
+    /// Long allocation descriptors instead of short ones.
+    pub long_ad: bool,
+    /// Data inside the file entry itself.
+    pub embedded: bool,
+    /// Split the data into extents of this many blocks.
+    pub extent_blocks: Option<usize>,
+}
+
+enum UdfNode {
+    Dir { name: String, parent: Option<usize> },
+    File { name: String, parent: Option<usize>, data: Vec<u8>, opts: UdfFileOpts },
+    Deleted { name: String, parent: Option<usize> },
+}
+
+impl UdfNode {
+    fn parent(&self) -> Option<usize> {
+        match self {
+            UdfNode::Dir { parent, .. } | UdfNode::File { parent, .. } | UdfNode::Deleted { parent, .. } => *parent,
+        }
+    }
+    fn name(&self) -> &str {
+        match self {
+            UdfNode::Dir { name, .. } | UdfNode::File { name, .. } | UdfNode::Deleted { name, .. } => name,
+        }
+    }
+}
+
+/// Minimal UDF 2.01 writer (one physical partition) for tests; directories fit one block.
+pub struct UdfBuilder {
+    label: String,
+    nodes: Vec<UdfNode>,
+}
+
+const UDF_PARTITION_START: usize = 300;
+
+impl UdfBuilder {
+    pub fn new(label: &str) -> Self {
+        Self { label: label.to_owned(), nodes: Vec::new() }
+    }
+
+    pub fn dir(&mut self, parent: Option<usize>, name: &str) -> usize {
+        self.nodes.push(UdfNode::Dir { name: name.to_owned(), parent });
+        self.nodes.len() - 1
+    }
+
+    pub fn file(&mut self, parent: Option<usize>, name: &str, data: Vec<u8>, opts: UdfFileOpts) {
+        self.nodes.push(UdfNode::File { name: name.to_owned(), parent, data, opts });
+    }
+
+    /// A file identifier marked deleted (its file entry is a valid empty file).
+    pub fn deleted(&mut self, parent: Option<usize>, name: &str) {
+        self.nodes.push(UdfNode::Deleted { name: name.to_owned(), parent });
+    }
+
+    pub fn build(&self) -> Vec<u8> {
+        // Logical blocks in the partition: 0 file set, 1 root entry, 2 root data, then per node.
+        let mut next = 3usize;
+        let mut entry_lb = vec![0usize; self.nodes.len()];
+        let mut data_lb: Vec<Vec<(usize, usize)>> = vec![Vec::new(); self.nodes.len()]; // (lb, bytes)
+        for (i, node) in self.nodes.iter().enumerate() {
+            entry_lb[i] = next;
+            next += 1;
+            match node {
+                UdfNode::Dir { .. } => {
+                    data_lb[i].push((next, 0));
+                    next += 1;
+                }
+                UdfNode::File { data, opts, .. } if !opts.embedded => {
+                    let blocks = data.len().div_ceil(ISO_SECTOR);
+                    let per = opts.extent_blocks.unwrap_or(blocks.max(1));
+                    let mut done = 0;
+                    while done < data.len() {
+                        let len = (data.len() - done).min(per * ISO_SECTOR);
+                        data_lb[i].push((next, len));
+                        next += len.div_ceil(ISO_SECTOR);
+                        done += len;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut img = vec![0u8; (UDF_PARTITION_START + next) * ISO_SECTOR];
+        let block = |lb: usize| {
+            let at = (UDF_PARTITION_START + lb) * ISO_SECTOR;
+            at..at + ISO_SECTOR
+        };
+        let tagged = |id: u16| {
+            let mut b = vec![0u8; ISO_SECTOR];
+            b[0..2].copy_from_slice(&id.to_le_bytes());
+            b
+        };
+        let dstring = |text: &str, len: usize| {
+            let mut f = vec![0u8; len];
+            f[0] = 8;
+            f[1..1 + text.len()].copy_from_slice(text.as_bytes());
+            f[len - 1] = (1 + text.len()) as u8;
+            f
+        };
+        let long_ad = |len: usize, lb: usize| {
+            let mut a = vec![0u8; 16];
+            a[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+            a[4..8].copy_from_slice(&(lb as u32).to_le_bytes());
+            a
+        };
+
+        for (n, id) in [(16, b"BEA01"), (17, b"NSR02"), (18, b"TEA01")] {
+            img[n * ISO_SECTOR + 1..n * ISO_SECTOR + 6].copy_from_slice(id);
+            img[n * ISO_SECTOR + 6] = 1;
+        }
+        let mut pvd = tagged(1);
+        pvd[24..56].copy_from_slice(&dstring("PVD-ID", 32));
+        let mut pd = tagged(5);
+        pd[188..192].copy_from_slice(&(UDF_PARTITION_START as u32).to_le_bytes());
+        pd[192..196].copy_from_slice(&(next as u32).to_le_bytes());
+        let mut lvd = tagged(6);
+        lvd[84..212].copy_from_slice(&dstring(&self.label, 128));
+        lvd[212..216].copy_from_slice(&(ISO_SECTOR as u32).to_le_bytes());
+        lvd[248..264].copy_from_slice(&long_ad(ISO_SECTOR, 0));
+        lvd[268..272].copy_from_slice(&1u32.to_le_bytes());
+        lvd[440..446].copy_from_slice(&[1, 6, 1, 0, 0, 0]);
+        for (n, d) in [(32, pvd), (33, pd), (34, lvd), (35, tagged(8))] {
+            img[n * ISO_SECTOR..(n + 1) * ISO_SECTOR].copy_from_slice(&d);
+        }
+        let mut anchor = tagged(2);
+        anchor[16..20].copy_from_slice(&(4 * ISO_SECTOR as u32).to_le_bytes());
+        anchor[20..24].copy_from_slice(&32u32.to_le_bytes());
+        img[256 * ISO_SECTOR..257 * ISO_SECTOR].copy_from_slice(&anchor);
+
+        let mut fsd = tagged(256);
+        fsd[400..416].copy_from_slice(&long_ad(ISO_SECTOR, 1));
+        img[block(0)].copy_from_slice(&fsd);
+
+        // File entry with short ADs for directories; per-node options for files.
+        let entry = |file_type: u8, data: &[u8], extents: &[(usize, usize)], opts: UdfFileOpts| {
+            let mut e = tagged(if opts.extended { 266 } else { 261 });
+            let (time_at, ea_len_at, base) = if opts.extended { (92, 208, 216) } else { (84, 168, 176) };
+            e[16 + 11] = file_type;
+            let ad_type: u16 = if opts.embedded { 3 } else if opts.long_ad { 1 } else { 0 };
+            e[16 + 18..16 + 20].copy_from_slice(&ad_type.to_le_bytes());
+            e[56..64].copy_from_slice(&(data.len() as u64).to_le_bytes());
+            e[time_at + 2..time_at + 4].copy_from_slice(&2025u16.to_le_bytes());
+            e[time_at + 4..time_at + 9].copy_from_slice(&[1, 2, 3, 4, 5]);
+            let mut ads = Vec::new();
+            if opts.embedded {
+                ads.extend_from_slice(data);
+            } else {
+                for &(lb, len) in extents {
+                    if opts.long_ad {
+                        ads.extend(long_ad(len, lb));
+                    } else {
+                        ads.extend((len as u32).to_le_bytes());
+                        ads.extend((lb as u32).to_le_bytes());
+                    }
+                }
+            }
+            e[ea_len_at + 4..ea_len_at + 8].copy_from_slice(&(ads.len() as u32).to_le_bytes());
+            e[base..base + ads.len()].copy_from_slice(&ads);
+            e
+        };
+        let fid = |name: &str, characteristics: u8, lb: usize| {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            let raw: Vec<u8> = if units.iter().all(|&u| u < 0x100) {
+                std::iter::once(8u8).chain(units.iter().map(|&u| u as u8)).collect()
+            } else {
+                std::iter::once(16u8).chain(units.iter().flat_map(|u| u.to_be_bytes())).collect()
+            };
+            let raw = if name.is_empty() { Vec::new() } else { raw };
+            let mut f = vec![0u8; 38];
+            f[0..2].copy_from_slice(&257u16.to_le_bytes());
+            f[16] = 1;
+            f[18] = characteristics;
+            f[19] = raw.len() as u8;
+            f[20..36].copy_from_slice(&long_ad(ISO_SECTOR, lb));
+            f.extend(raw);
+            f.resize(f.len().next_multiple_of(4), 0);
+            f
+        };
+
+        let dirs: Vec<Option<usize>> = std::iter::once(None)
+            .chain((0..self.nodes.len()).filter(|&i| matches!(self.nodes[i], UdfNode::Dir { .. })).map(Some))
+            .collect();
+        for &dir in &dirs {
+            let (self_lb, data_block) = match dir {
+                None => (1, 2),
+                Some(i) => (entry_lb[i], data_lb[i][0].0),
+            };
+            let parent_lb = dir.and_then(|i| self.nodes[i].parent()).map_or(1, |p| entry_lb[p]);
+            let mut listing = fid("", 0x0A, parent_lb);
+            for (i, node) in self.nodes.iter().enumerate().filter(|(_, n)| n.parent() == dir) {
+                let characteristics = match node {
+                    UdfNode::Dir { .. } => 0x02,
+                    UdfNode::Deleted { .. } => 0x04,
+                    UdfNode::File { .. } => 0,
+                };
+                listing.extend(fid(node.name(), characteristics, entry_lb[i]));
+            }
+            assert!(listing.len() <= ISO_SECTOR, "test directory exceeds one block");
+            let r = block(data_block);
+            img[r.start..r.start + listing.len()].copy_from_slice(&listing);
+            let e = entry(4, &listing, &[(data_block, listing.len())], UdfFileOpts::default());
+            img[block(self_lb)].copy_from_slice(&e);
+        }
+        for (i, node) in self.nodes.iter().enumerate() {
+            let (data, opts) = match node {
+                UdfNode::File { data, opts, .. } => (data.as_slice(), *opts),
+                UdfNode::Deleted { .. } => (&[][..], UdfFileOpts::default()),
+                UdfNode::Dir { .. } => continue,
+            };
+            let mut done = 0;
+            for &(lb, len) in &data_lb[i] {
+                let at = (UDF_PARTITION_START + lb) * ISO_SECTOR;
+                img[at..at + len].copy_from_slice(&data[done..done + len]);
+                done += len;
+            }
+            let e = entry(5, data, &data_lb[i], opts);
+            img[block(entry_lb[i])].copy_from_slice(&e);
+        }
+        img
+    }
+}

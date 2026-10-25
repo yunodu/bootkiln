@@ -1,11 +1,11 @@
 //! Read-only ISO 9660 directory tree, with Rock Ridge or Joliet names when present.
 
 use std::collections::HashSet;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 
+use crate::disc::{DiscEntry, DiscKind, DiscTree, Extent, SECTOR, read_exact_at};
 use crate::error::Error;
 
-pub const SECTOR: u64 = 2048;
 const FIRST_DESCRIPTOR: u64 = 16;
 /// Volume descriptor sets are short; this bounds the scan on garbage input.
 const MAX_DESCRIPTORS: u64 = 64;
@@ -25,47 +25,6 @@ const FLAG_MULTI_EXTENT: u8 = 0x80;
 const S_IFMT: u32 = 0o170000;
 const S_IFLNK: u32 = 0o120000;
 
-#[derive(Debug, Clone)]
-pub struct IsoTree {
-    /// Primary volume identifier: what Linux reports as the filesystem label.
-    pub label: String,
-    /// Volume creation date in directory-record form (all zero when unset).
-    pub created: [u8; 7],
-    pub root: Vec<IsoEntry>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IsoEntry {
-    pub name: String,
-    /// ISO 9660 recording date: years since 1900, month, day, hour, minute, second, GMT offset.
-    pub recorded: [u8; 7],
-    pub kind: IsoKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum IsoKind {
-    Dir(Vec<IsoEntry>),
-    /// Data extents in file order.
-    File(Vec<Extent>),
-    Symlink,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Extent {
-    /// Byte offset in the image.
-    pub offset: u64,
-    pub len: u64,
-}
-
-impl IsoEntry {
-    pub fn file_len(&self) -> u64 {
-        match &self.kind {
-            IsoKind::File(extents) => extents.iter().map(|e| e.len).sum(),
-            _ => 0,
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Naming {
     RockRidge { skip: usize },
@@ -74,7 +33,7 @@ enum Naming {
 }
 
 /// Read the directory tree; [`Error::NotIso9660`] if there is no primary volume descriptor.
-pub fn read_tree<R: Read + Seek>(image: &mut R) -> Result<IsoTree, Error> {
+pub fn read_tree<R: Read + Seek>(image: &mut R) -> Result<DiscTree, Error> {
     let mut primary = None;
     let mut joliet_root = None;
     for n in FIRST_DESCRIPTOR..FIRST_DESCRIPTOR + MAX_DESCRIPTORS {
@@ -108,7 +67,7 @@ pub fn read_tree<R: Read + Seek>(image: &mut R) -> Result<IsoTree, Error> {
     };
     let mut reader = TreeReader { image, naming, visited: HashSet::new() };
     let root = reader.read_dir(root, 0)?;
-    Ok(IsoTree { label, created: descriptor_date(&primary[813..830]), root })
+    Ok(DiscTree { label, created: descriptor_date(&primary[813..830]), root })
 }
 
 /// Volume descriptor dates are ASCII "YYYYMMDDHHMMSScc" plus a GMT offset byte.
@@ -165,7 +124,7 @@ struct RockRidge {
 }
 
 impl<R: Read + Seek> TreeReader<'_, R> {
-    fn read_dir(&mut self, (lba, size): DirLocation, depth: usize) -> Result<Vec<IsoEntry>, Error> {
+    fn read_dir(&mut self, (lba, size): DirLocation, depth: usize) -> Result<Vec<DiscEntry>, Error> {
         if depth > MAX_DEPTH {
             return Err(invalid("directories nested too deeply".into()));
         }
@@ -226,18 +185,18 @@ impl<R: Read + Seek> TreeReader<'_, R> {
             let location = (le32(record, 2), le32(record, 10));
 
             if rr.symlink {
-                entries.push(IsoEntry { name, recorded, kind: IsoKind::Symlink });
+                entries.push(DiscEntry { name, recorded, kind: DiscKind::Symlink });
                 continue;
             }
             if let Some(child_lba) = rr.child_link {
                 let size = self.dot_record_size(child_lba)?;
                 let children = self.read_dir((child_lba, size), depth + 1)?;
-                entries.push(IsoEntry { name, recorded, kind: IsoKind::Dir(children) });
+                entries.push(DiscEntry { name, recorded, kind: DiscKind::Dir(children) });
                 continue;
             }
             if flags & FLAG_DIRECTORY != 0 {
                 let children = self.read_dir(location, depth + 1)?;
-                entries.push(IsoEntry { name, recorded, kind: IsoKind::Dir(children) });
+                entries.push(DiscEntry { name, recorded, kind: DiscKind::Dir(children) });
                 continue;
             }
 
@@ -253,7 +212,7 @@ impl<R: Read + Seek> TreeReader<'_, R> {
             if flags & FLAG_MULTI_EXTENT != 0 {
                 pending = Some((raw_name.to_vec(), extents));
             } else {
-                entries.push(IsoEntry { name, recorded, kind: IsoKind::File(extents) });
+                entries.push(DiscEntry { name, recorded, kind: DiscKind::File(extents) });
             }
         }
         if pending.is_some() {
@@ -333,23 +292,13 @@ fn invalid(message: String) -> Error {
     Error::InvalidIso(message)
 }
 
-/// Fills `buf` from `offset`; `false` if the image is too short.
-fn read_exact_at<R: Read + Seek>(image: &mut R, offset: u64, buf: &mut [u8]) -> io::Result<bool> {
-    image.seek(SeekFrom::Start(offset))?;
-    match image.read_exact(buf) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::{IsoBuilder, IsoNaming};
     use std::io::Cursor;
 
-    fn names(entries: &[IsoEntry]) -> Vec<&str> {
+    fn names(entries: &[DiscEntry]) -> Vec<&str> {
         entries.iter().map(|e| e.name.as_str()).collect()
     }
 
@@ -363,8 +312,8 @@ mod tests {
         iso.build()
     }
 
-    fn file_bytes(img: &[u8], entry: &IsoEntry) -> Vec<u8> {
-        let IsoKind::File(extents) = &entry.kind else { panic!("{} is not a file", entry.name) };
+    fn file_bytes(img: &[u8], entry: &DiscEntry) -> Vec<u8> {
+        let DiscKind::File(extents) = &entry.kind else { panic!("{} is not a file", entry.name) };
         extents.iter().flat_map(|e| img[e.offset as usize..(e.offset + e.len) as usize].to_vec()).collect()
     }
 
@@ -375,12 +324,12 @@ mod tests {
         assert_eq!(tree.label, "My-Label");
         assert_eq!(names(&tree.root), ["EFI", "README.txt", "empty"]);
 
-        let IsoKind::Dir(efi) = &tree.root[0].kind else { panic!("EFI is not a directory") };
-        let IsoKind::Dir(boot) = &efi[0].kind else { panic!("BOOT is not a directory") };
+        let DiscKind::Dir(efi) = &tree.root[0].kind else { panic!("EFI is not a directory") };
+        let DiscKind::Dir(boot) = &efi[0].kind else { panic!("BOOT is not a directory") };
         assert_eq!(names(boot), ["bootx64.efi"]);
         assert_eq!(file_bytes(&img, &boot[0]), b"shim");
         assert_eq!(file_bytes(&img, &tree.root[1]), vec![b'r'; 3000]);
-        assert!(matches!(&tree.root[2].kind, IsoKind::File(e) if e.is_empty()));
+        assert!(matches!(&tree.root[2].kind, DiscKind::File(e) if e.is_empty()));
     }
 
     #[test]
@@ -410,7 +359,7 @@ mod tests {
         let mut iso = IsoBuilder::new("X", IsoNaming::RockRidge);
         iso.symlink(None, "ubuntu");
         let tree = read_tree(&mut Cursor::new(iso.build())).unwrap();
-        assert!(matches!(tree.root[0].kind, IsoKind::Symlink));
+        assert!(matches!(tree.root[0].kind, DiscKind::Symlink));
     }
 
     #[test]

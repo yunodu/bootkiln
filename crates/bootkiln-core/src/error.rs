@@ -22,6 +22,10 @@ pub enum Error {
     NameConflict { path: String },
     #[error("{path}: not a valid FAT file name")]
     InvalidName { path: String },
-    #[error("the files need {needed} bytes but the drive's FAT32 volume holds {available}")]
+    #[error("the files need {needed} bytes but the drive's volume holds {available}")]
     DriveTooSmall { needed: u64, available: u64 },
+    #[error("verification failed: {path} on the drive differs from the image")]
+    FileMismatch { path: String },
+    #[error("{0}")]
+    WindowsOption(String),
 }

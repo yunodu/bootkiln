@@ -6,10 +6,9 @@
 use std::collections::HashSet;
 
 use crate::error::Error;
+use crate::mbr::{self, BOOT_STUB, PARTITION_ALIGN};
 use crate::plan::{Plan, Source};
 
-/// Partition start; 1 MiB keeps flash erase blocks and every cluster size aligned.
-const PARTITION_ALIGN: u64 = 1024 * 1024;
 /// Zeroed at the end of the disk so a stale backup GPT cannot shadow the new MBR.
 const TAIL_WIPE: u64 = 1024 * 1024;
 const MIN_RESERVED_SECTORS: u64 = 32;
@@ -22,12 +21,6 @@ const END_OF_CHAIN: u32 = 0x0FFF_FFFF;
 const MEDIA_FIXED: u8 = 0xF8;
 const FSINFO_SECTOR: u16 = 1;
 const BACKUP_BOOT_SECTOR: u16 = 6;
-const MBR_TYPE_FAT32_LBA: u8 = 0x0C;
-const MBR_ACTIVE: u8 = 0x80;
-/// CHS placeholder for LBA-addressed partitions.
-const CHS_LBA: [u8; 3] = [0xFE, 0xFF, 0xFF];
-/// `int 18h` (try the next boot device), then halt forever: legacy BIOS boot falls through.
-const BOOT_STUB: [u8; 5] = [0xCD, 0x18, 0xF4, 0xEB, 0xFD];
 const DIR_ENTRY: usize = 32;
 const LFN_CHARS: usize = 13;
 const LFN_CHAR_OFFSETS: [usize; LFN_CHARS] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
@@ -91,7 +84,7 @@ pub fn layout(root: &[Node], volume: &Volume, disk_size: u64, sector_size: u32) 
 
     let mut runs = Vec::new();
     let sector = geometry.sector;
-    runs.push((0, Source::Bytes(mbr(&geometry, volume.disk_signature))));
+    runs.push((0, Source::Bytes(mbr_sector(&geometry, volume.disk_signature))));
     runs.push((sector, Source::Zeros(geometry.partition_offset - sector)));
     runs.push((geometry.partition_offset, Source::Bytes(reserved_region(&geometry, volume, &fat))));
 
@@ -469,20 +462,14 @@ fn short_entry(name: &[u8; 11], attr: u8, cluster: u32, size: u32, time: DosTime
     e
 }
 
-fn mbr(g: &Geometry, disk_signature: u32) -> Vec<u8> {
-    let mut s = vec![0u8; g.sector as usize];
-    s[..BOOT_STUB.len()].copy_from_slice(&BOOT_STUB);
-    s[440..444].copy_from_slice(&disk_signature.to_le_bytes());
-    let entry = &mut s[446..462];
-    entry[0] = MBR_ACTIVE;
-    entry[1..4].copy_from_slice(&CHS_LBA);
-    entry[4] = MBR_TYPE_FAT32_LBA;
-    entry[5..8].copy_from_slice(&CHS_LBA);
-    entry[8..12].copy_from_slice(&((g.partition_offset / g.sector) as u32).to_le_bytes());
-    entry[12..16].copy_from_slice(&(g.partition_sectors as u32).to_le_bytes());
-    s[510] = 0x55;
-    s[511] = 0xAA;
-    s
+fn mbr_sector(g: &Geometry, disk_signature: u32) -> Vec<u8> {
+    let partition = mbr::Partition {
+        kind: mbr::TYPE_FAT32_LBA,
+        active: true,
+        start_lba: (g.partition_offset / g.sector) as u32,
+        sectors: g.partition_sectors as u32,
+    };
+    mbr::sector(g.sector, disk_signature, &[partition])
 }
 
 /// Boot sector, FSInfo and their backups; the rest of the reserved area is zero.
@@ -641,8 +628,8 @@ mod tests {
         assert!(up.contains(&"c".to_owned()), "{up:?}");
 
         let entry = &disk.data[446..462];
-        assert_eq!(entry[0], MBR_ACTIVE);
-        assert_eq!(entry[4], MBR_TYPE_FAT32_LBA);
+        assert_eq!(entry[0], 0x80, "active");
+        assert_eq!(entry[4], mbr::TYPE_FAT32_LBA);
         assert_eq!(u32::from_le_bytes(entry[8..12].try_into().unwrap()), 2048);
         assert_eq!(&disk.data[510..512], [0x55, 0xAA]);
         assert_eq!(u32::from_le_bytes(disk.data[440..444].try_into().unwrap()), 0x1234_5678);

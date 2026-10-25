@@ -1,3 +1,4 @@
 /target
 *.iso
 *.img
+!/crates/bootkiln-core/assets/uefi-ntfs.img

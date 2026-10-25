@@ -1,79 +1,135 @@
-//! ISO mode: copy a bootable ISO's files onto a fresh FAT32 drive that UEFI firmware boots.
+//! ISO mode: copy a bootable ISO's files onto a fresh drive that UEFI firmware boots.
+//!
+//! The drive gets FAT32 unless a file is 4 GiB or larger; then it gets NTFS plus a
+//! UEFI:NTFS boot partition ([`crate::uefi_ntfs`]).
 //!
 //! Boot loaders find the live system by filesystem label, and a FAT label (11 upper-case
-//! characters) usually cannot equal the ISO label, so boot configuration files that name
-//! the ISO label are rewritten to name the FAT label.
+//! characters) or NTFS label (32 characters) may not equal the ISO label, so boot
+//! configuration files that name the ISO label are rewritten to name the drive's label.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 
+use crate::disc::{self, DiscEntry, DiscKind};
 use crate::error::Error;
 use crate::fat32::{self, DosTime, Node, NodeKind, Volume};
-use crate::iso9660::{self, IsoEntry, IsoKind};
 use crate::plan::{Plan, Source};
+use crate::windows_iso::{self, WindowsInfo};
 
 /// Boot configuration files larger than this are not scanned for the label.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const CONFIG_EXTENSIONS: [&str; 2] = [".cfg", ".conf"];
 const FALLBACK_LABEL: &str = "BOOTKILN";
 const COMPARE_CHUNK: usize = 1024 * 1024;
+/// FAT32 stores file sizes in 32 bits.
+const FAT32_MAX_FILE: u64 = u32::MAX as u64;
+const NTFS_LABEL_CHARS: usize = 32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSystem {
+    Fat32,
+    /// NTFS data partition plus a UEFI:NTFS boot partition.
+    Ntfs,
+}
+
+/// The files of a bootable ISO, adapted for the drive's file system.
 #[derive(Debug)]
-pub struct IsoModeLayout {
-    pub plan: Plan,
+pub struct IsoContent {
     pub iso_label: String,
-    pub fat_label: String,
-    /// Boot configuration files rewritten to the FAT label.
+    pub file_system: FileSystem,
+    /// Volume label for `file_system`.
+    pub label: String,
+    pub windows: Option<WindowsInfo>,
+    /// Files of 4 GiB or more; they are why `file_system` is NTFS.
+    pub large_files: Vec<String>,
+    /// Boot configuration files rewritten to `label`.
     pub patched: Vec<String>,
-    /// Symbolic links, which FAT cannot represent.
+    /// Symbolic links, which neither FAT nor (portably) NTFS can hold.
     pub skipped_symlinks: Vec<String>,
     /// Files dropped because an identical file differing only in name case was kept.
     pub merged_duplicates: Vec<String>,
+    nodes: Vec<Node>,
+    created: DosTime,
 }
 
-/// Plan an MBR + FAT32 drive holding the files of the ISO in `image`.
-pub fn layout<R: Read + Seek>(
-    image: &mut R,
-    disk_size: u64,
-    sector_size: u32,
-    volume_id: u32,
-    disk_signature: u32,
-) -> Result<IsoModeLayout, Error> {
-    let tree = iso9660::read_tree(image)?;
+/// Read the ISO in `image` and adapt its files for the drive.
+pub fn prepare<R: Read + Seek>(image: &mut R) -> Result<IsoContent, Error> {
+    let tree = disc::read_tree(image)?;
     if !has_uefi_loader(&tree.root) {
         return Err(Error::NoUefiBootloader);
     }
-    let fat_label = fat_label(&tree.label);
+    let windows = windows_iso::detect(image, &tree.root)?;
+    let mut large_files = Vec::new();
+    collect_large(&tree.root, "", &mut large_files);
+    let (file_system, label) = if large_files.is_empty() {
+        (FileSystem::Fat32, fat_label(&tree.label))
+    } else {
+        (FileSystem::Ntfs, ntfs_label(&tree.label))
+    };
+
     let mut converter = Converter {
         image,
         iso_label: &tree.label,
-        fat_label: &fat_label,
+        label: &label,
         patched: Vec::new(),
         skipped_symlinks: Vec::new(),
         merged_duplicates: Vec::new(),
     };
-    let root = converter.convert(&tree.root, "")?;
+    let nodes = converter.convert(&tree.root, "")?;
     let Converter { patched, skipped_symlinks, merged_duplicates, .. } = converter;
+    Ok(IsoContent {
+        iso_label: tree.label,
+        file_system,
+        label,
+        windows,
+        large_files,
+        patched,
+        skipped_symlinks,
+        merged_duplicates,
+        nodes,
+        created: dos_time(tree.created),
+    })
+}
 
-    let volume = Volume { label: &fat_label, volume_id, disk_signature, created: dos_time(tree.created) };
-    let plan = fat32::layout(&root, &volume, disk_size, sector_size)?;
-    Ok(IsoModeLayout { plan, iso_label: tree.label, fat_label, patched, skipped_symlinks, merged_duplicates })
+impl IsoContent {
+    pub fn nodes(&self) -> &[Node] {
+        &self.nodes
+    }
+
+    /// Put `data` at the drive root as `name`, replacing any root entry of that name.
+    pub fn add_root_file(&mut self, name: &str, data: Vec<u8>) {
+        self.nodes.retain(|n| !n.name.eq_ignore_ascii_case(name));
+        self.nodes.push(Node { name: name.to_owned(), modified: self.created, kind: NodeKind::File(vec![Source::Bytes(data)]) });
+    }
+
+    /// MBR + FAT32 drive holding the files; only valid for [`FileSystem::Fat32`].
+    pub fn fat32_plan(&self, disk_size: u64, sector_size: u32, volume_id: u32, disk_signature: u32) -> Result<Plan, Error> {
+        assert_eq!(self.file_system, FileSystem::Fat32, "files of 4 GiB or more need NTFS");
+        let volume = Volume { label: &self.label, volume_id, disk_signature, created: self.created };
+        fat32::layout(&self.nodes, &volume, disk_size, sector_size)
+    }
+}
+
+fn collect_large(entries: &[DiscEntry], dir_path: &str, out: &mut Vec<String>) {
+    for entry in entries {
+        let path = format!("{dir_path}/{}", entry.name);
+        match &entry.kind {
+            DiscKind::Dir(children) => collect_large(children, &path, out),
+            DiscKind::File(_) if entry.file_len() > FAT32_MAX_FILE => out.push(path),
+            _ => {}
+        }
+    }
 }
 
 /// UEFI removable-media boot path: `\EFI\BOOT\BOOT<arch>.EFI`, matched case-insensitively.
-fn has_uefi_loader(root: &[IsoEntry]) -> bool {
-    fn subdir<'a>(entries: &'a [IsoEntry], name: &str) -> Option<&'a [IsoEntry]> {
-        entries.iter().find_map(|e| match &e.kind {
-            IsoKind::Dir(children) if e.name.eq_ignore_ascii_case(name) => Some(children.as_slice()),
-            _ => None,
-        })
-    }
-    subdir(root, "EFI").and_then(|efi| subdir(efi, "BOOT")).is_some_and(|boot| {
-        boot.iter().any(|e| {
+fn has_uefi_loader(root: &[DiscEntry]) -> bool {
+    match disc::find(root, &["EFI", "BOOT"]).map(|e| &e.kind) {
+        Some(DiscKind::Dir(boot)) => boot.iter().any(|e| {
             let name = e.name.to_ascii_uppercase();
-            matches!(e.kind, IsoKind::File(_)) && name.starts_with("BOOT") && name.ends_with(".EFI")
-        })
-    })
+            matches!(e.kind, DiscKind::File(_)) && name.starts_with("BOOT") && name.ends_with(".EFI")
+        }),
+        _ => false,
+    }
 }
 
 /// Upper-case, `[A-Z0-9_-]` only, at most 11 characters.
@@ -89,12 +145,19 @@ fn fat_label(iso_label: &str) -> String {
     if label.is_empty() { FALLBACK_LABEL.to_owned() } else { label }
 }
 
+/// The ISO label without control characters, at most 32 characters.
+fn ntfs_label(iso_label: &str) -> String {
+    let label: String = iso_label.chars().filter(|c| !c.is_control()).take(NTFS_LABEL_CHARS).collect();
+    if label.is_empty() { FALLBACK_LABEL.to_owned() } else { label }
+}
+
 fn dos_time(recorded: [u8; 7]) -> DosTime {
     let [year, month, day, hour, minute, second, _] = recorded;
     DosTime::new(1900 + u16::from(year), month, day, hour, minute, second)
 }
 
-/// FAT long names cannot contain `"*/:<>?\|` or control characters, nor end in a space or dot.
+/// Windows and FAT long names cannot contain `"*/:<>?\|` or control characters, nor end
+/// in a space or dot.
 fn fat_name(name: &str) -> String {
     let replaced: String = name.chars().map(|c| if c < ' ' || "\"*/:<>?\\|".contains(c) { '_' } else { c }).collect();
     let trimmed = replaced.trim_end_matches([' ', '.']);
@@ -104,14 +167,14 @@ fn fat_name(name: &str) -> String {
 struct Converter<'a, R> {
     image: &'a mut R,
     iso_label: &'a str,
-    fat_label: &'a str,
+    label: &'a str,
     patched: Vec<String>,
     skipped_symlinks: Vec<String>,
     merged_duplicates: Vec<String>,
 }
 
 impl<R: Read + Seek> Converter<'_, R> {
-    fn convert(&mut self, entries: &[IsoEntry], dir_path: &str) -> Result<Vec<Node>, Error> {
+    fn convert(&mut self, entries: &[DiscEntry], dir_path: &str) -> Result<Vec<Node>, Error> {
         let mut nodes: Vec<Node> = Vec::with_capacity(entries.len());
         // Upper-cased name -> index in `nodes`.
         let mut by_name: HashMap<String, usize> = HashMap::new();
@@ -119,12 +182,12 @@ impl<R: Read + Seek> Converter<'_, R> {
             let name = fat_name(&entry.name);
             let path = format!("{dir_path}/{name}");
             let kind = match &entry.kind {
-                IsoKind::Symlink => {
+                DiscKind::Symlink => {
                     self.skipped_symlinks.push(path);
                     continue;
                 }
-                IsoKind::Dir(children) => NodeKind::Dir(self.convert(children, &path)?),
-                IsoKind::File(extents) => {
+                DiscKind::Dir(children) => NodeKind::Dir(self.convert(children, &path)?),
+                DiscKind::File(extents) => {
                     let sources = extents.iter().map(|e| Source::Image { offset: e.offset, len: e.len }).collect();
                     NodeKind::File(self.patch_config(&name, &path, sources)?)
                 }
@@ -147,12 +210,12 @@ impl<R: Read + Seek> Converter<'_, R> {
         Ok(nodes)
     }
 
-    /// Rewrite the ISO label to the FAT label in boot configuration files.
+    /// Rewrite the ISO label to the drive label in boot configuration files.
     fn patch_config(&mut self, name: &str, path: &str, sources: Vec<Source>) -> Result<Vec<Source>, Error> {
         let lower = name.to_ascii_lowercase();
         let len: u64 = sources.iter().map(Source::len).sum();
         if self.iso_label.is_empty()
-            || self.iso_label == self.fat_label
+            || self.iso_label == self.label
             || len > MAX_CONFIG_BYTES
             || !CONFIG_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
         {
@@ -160,7 +223,7 @@ impl<R: Read + Seek> Converter<'_, R> {
         }
         let mut text = vec![0u8; len as usize];
         fill(self.image, &sources, 0, &mut text)?;
-        match patch_label(&text, self.iso_label, self.fat_label) {
+        match patch_label(&text, self.iso_label, self.label) {
             Some(patched) => {
                 self.patched.push(path.to_owned());
                 Ok(vec![Source::Bytes(patched)])
@@ -191,7 +254,7 @@ impl<R: Read + Seek> Converter<'_, R> {
 }
 
 /// Fill `buf` with the bytes at `offset` of the concatenated `sources`.
-fn fill<R: Read + Seek>(image: &mut R, sources: &[Source], mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+pub(crate) fn fill<R: Read + Seek>(image: &mut R, sources: &[Source], mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
     for source in sources {
         if buf.is_empty() {
             break;
@@ -253,7 +316,7 @@ mod tests {
     use super::*;
     use crate::plan::write_plan;
     use crate::testutil::{IsoBuilder, IsoNaming, MemDisk, pattern};
-    use fatfs::{FileSystem, FsOptions};
+    use fatfs::FsOptions;
     use std::io::Cursor;
 
     const DISK: usize = 40 * 1024 * 1024;
@@ -275,14 +338,15 @@ mod tests {
         iso
     }
 
-    fn write_to_disk(iso: &[u8]) -> (IsoModeLayout, MemDisk) {
-        let layout = layout(&mut Cursor::new(iso), DISK as u64, 512, 0x1234_5678, 0xCAFE_F00D).unwrap();
+    fn write_to_disk(iso: &[u8]) -> (IsoContent, MemDisk) {
+        let content = prepare(&mut Cursor::new(iso)).unwrap();
+        let plan = content.fat32_plan(DISK as u64, 512, 0x1234_5678, 0xCAFE_F00D).unwrap();
         let mut disk = MemDisk::new(DISK, 512);
-        write_plan(&mut Cursor::new(iso), &layout.plan, &mut disk, &mut |_| {}).unwrap();
-        (layout, disk)
+        write_plan(&mut Cursor::new(iso), &plan, &mut disk, &mut |_| {}).unwrap();
+        (content, disk)
     }
 
-    fn read_file(fs: &FileSystem<Cursor<Vec<u8>>>, path: &str) -> Vec<u8> {
+    fn read_file(fs: &fatfs::FileSystem<Cursor<Vec<u8>>>, path: &str) -> Vec<u8> {
         let mut data = Vec::new();
         fs.root_dir().open_file(path).unwrap().read_to_end(&mut data).unwrap();
         data
@@ -291,14 +355,16 @@ mod tests {
     #[test]
     fn copies_files_to_a_fat32_volume_with_patched_label() {
         let iso = fedora_like().build();
-        let (layout, disk) = write_to_disk(&iso);
-        assert_eq!(layout.fat_label, "FEDORA-KDE-");
-        assert_eq!(layout.patched, ["/EFI/BOOT/grub.cfg"]);
-        assert_eq!(layout.skipped_symlinks, ["/fedora"]);
-        assert_eq!(layout.merged_duplicates, ["/EFI/BOOT/bootx64.efi"]);
+        let (content, disk) = write_to_disk(&iso);
+        assert_eq!(content.file_system, FileSystem::Fat32);
+        assert_eq!(content.label, "FEDORA-KDE-");
+        assert_eq!(content.patched, ["/EFI/BOOT/grub.cfg"]);
+        assert_eq!(content.skipped_symlinks, ["/fedora"]);
+        assert_eq!(content.merged_duplicates, ["/EFI/BOOT/bootx64.efi"]);
+        assert!(content.windows.is_none());
 
         let partition = disk.data[1024 * 1024..].to_vec();
-        let fs = FileSystem::new(Cursor::new(partition), FsOptions::new()).unwrap();
+        let fs = fatfs::FileSystem::new(Cursor::new(partition), FsOptions::new()).unwrap();
         assert_eq!(fs.fat_type(), fatfs::FatType::Fat32);
         assert_eq!(fs.volume_label(), "FEDORA-KDE-");
         assert_eq!(read_file(&fs, "EFI/BOOT/BOOTX64.EFI"), b"shim");
@@ -323,7 +389,7 @@ mod tests {
         let boot = iso.dir(Some(efi), "BOOT");
         iso.file(Some(boot), "BOOTX64.EFI", b"one".to_vec());
         iso.file(Some(boot), "bootx64.efi", b"two".to_vec());
-        let err = layout(&mut Cursor::new(iso.build()), DISK as u64, 512, 1, 1).unwrap_err();
+        let err = prepare(&mut Cursor::new(iso.build())).unwrap_err();
         assert!(matches!(&err, Error::NameConflict { path } if path == "/EFI/BOOT/bootx64.efi"), "{err:?}");
     }
 
@@ -332,16 +398,49 @@ mod tests {
         let mut iso = IsoBuilder::new("TinyCore", IsoNaming::RockRidge);
         let boot = iso.dir(None, "boot");
         iso.file(Some(boot), "vmlinuz", b"kernel".to_vec());
-        let err = layout(&mut Cursor::new(iso.build()), DISK as u64, 512, 1, 1).unwrap_err();
+        let err = prepare(&mut Cursor::new(iso.build())).unwrap_err();
         assert!(matches!(err, Error::NoUefiBootloader), "{err:?}");
     }
 
     #[test]
-    fn label_fits_fat_rules() {
+    fn added_root_file_replaces_any_case_variant() {
+        let mut content = prepare(&mut Cursor::new(fedora_like().build())).unwrap();
+        content.add_root_file("AutoUnattend.xml", b"old".to_vec());
+        content.add_root_file("autounattend.xml", b"new".to_vec());
+        let root: Vec<&str> = content.nodes().iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(root, ["EFI", "LiveOS", "autounattend.xml"]);
+        assert!(matches!(&content.nodes()[2].kind, NodeKind::File(s) if s == &[Source::Bytes(b"new".to_vec())]));
+    }
+
+    #[test]
+    fn files_of_4_gib_or_more_are_listed_for_ntfs() {
+        let file = |name: &str, len: u64| DiscEntry {
+            name: name.into(),
+            recorded: [0; 7],
+            kind: DiscKind::File(vec![disc::Extent { offset: 0, len }]),
+        };
+        let tree = vec![
+            DiscEntry {
+                name: "sources".into(),
+                recorded: [0; 7],
+                kind: DiscKind::Dir(vec![file("install.wim", 1 << 32), file("boot.wim", u64::from(u32::MAX))]),
+            },
+            file("small", 1),
+        ];
+        let mut large = Vec::new();
+        collect_large(&tree, "", &mut large);
+        assert_eq!(large, ["/sources/install.wim"]);
+    }
+
+    #[test]
+    fn labels_fit_their_file_system() {
         assert_eq!(fat_label("Fedora-KDE-Live-44"), "FEDORA-KDE-");
         assert_eq!(fat_label("Ubuntu 24.04 LTS"), "UBUNTU_24_0");
         assert_eq!(fat_label("ARCH_202410"), "ARCH_202410");
         assert_eq!(fat_label(""), "BOOTKILN");
+        assert_eq!(ntfs_label("CCCOMA_X64FRE_EN-US_DV9"), "CCCOMA_X64FRE_EN-US_DV9");
+        assert_eq!(ntfs_label("Ubuntu 26.04.1 LTS amd64\u{1}"), "Ubuntu 26.04.1 LTS amd64");
+        assert_eq!(ntfs_label(&"x".repeat(40)), "x".repeat(32));
     }
 
     #[test]
