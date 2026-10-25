@@ -61,7 +61,15 @@ export const t = {
     verifyingFiles: "Verifying files",
   } satisfies Record<Phase, string>,
   progressOf: (done: string, total: string) => `${done} of ${total}`,
-  progressLeft: (eta: string) => `${eta} left`,
+  /** `seconds` is already rounded (see `roundEta`). */
+  timeLeft(seconds: number): string {
+    if (seconds < 60) return `about ${seconds} s left`;
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) return `${h} h ${String(m).padStart(2, "0")} min left`;
+    return s === 0 ? `${m} min left` : `${m} min ${String(s).padStart(2, "0")} s left`;
+  },
   formatting: "Preparing the NTFS volume…",
   cancel: "Cancel",
   cancelling: "Cancelling…",

@@ -18,15 +18,13 @@ export function rate(bytesPerSecond: number): string {
   return `${bytes(bytesPerSecond)}/s`;
 }
 
-/** "1 h 05 min", "4 min 10 s", "12 s". */
-export function duration(seconds: number): string {
-  const s = Math.max(0, Math.round(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const rest = s % 60;
-  if (h > 0) return `${h} h ${String(m).padStart(2, "0")} min`;
-  if (m > 0) return `${m} min ${String(rest).padStart(2, "0")} s`;
-  return `${rest} s`;
+/** Rounds time left more coarsely the further away it is, so the estimate reads
+ * steadily: 5 s steps under a minute, 10 s under ten minutes, whole minutes beyond. */
+export function roundEta(seconds: number): number {
+  const s = Math.max(0, seconds);
+  if (s < 60) return Math.max(5, Math.ceil(s / 5) * 5);
+  if (s < 600) return Math.ceil(s / 10) * 10;
+  return Math.ceil(s / 60) * 60;
 }
 
 export function fileName(path: string): string {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Phase, Progress } from "./api";
-  import { bytes, duration, rate } from "./format";
+  import { bytes, rate, roundEta } from "./format";
   import { t } from "./texts";
 
   let {
@@ -12,31 +12,49 @@
   }: { steps: Phase[]; progress: Progress | null; cancelling: boolean; context: string; onCancel: () => void } =
     $props();
 
-  // Smoothed throughput of the current phase.
+  /** Throughput is measured over this many recent seconds; USB writes are bursty. */
+  const RATE_WINDOW_S = 10;
+  /** No estimate until the window holds this much history. */
+  const MIN_HISTORY_S = 3;
+  /** The shown speed and time left change at most this often. */
+  const DISPLAY_INTERVAL_MS = 1000;
+
+  let samples: { phase: Phase; done: number; at: number }[] = [];
+  let lastShown = 0;
+  /** Plain copy of `eta`, so the effect does not depend on what it writes. */
+  let shownEta: number | null = null;
   let speed = $state(0);
-  let sample: { phase: Phase; done: number; at: number } | null = null;
+  let eta = $state<number | null>(null);
 
   $effect(() => {
     const p = progress;
     if (!p) return;
     const now = performance.now();
-    if (!sample || sample.phase !== p.phase || p.done < sample.done) {
-      sample = { phase: p.phase, done: p.done, at: now };
+    if (samples.length > 0 && (samples[0].phase !== p.phase || p.done < samples[samples.length - 1].done)) {
+      samples = [];
       speed = 0;
-      return;
+      eta = shownEta = null;
     }
-    const dt = (now - sample.at) / 1000;
-    if (dt >= 0.5) {
-      const instant = (p.done - sample.done) / dt;
-      speed = speed === 0 ? instant : speed * 0.7 + instant * 0.3;
-      sample = { phase: p.phase, done: p.done, at: now };
-    }
+    samples.push({ phase: p.phase, done: p.done, at: now });
+    while (samples.length > 2 && now - samples[1].at > RATE_WINDOW_S * 1000) samples.shift();
+
+    const first = samples[0];
+    const span = (now - first.at) / 1000;
+    if (span < MIN_HISTORY_S || now - lastShown < DISPLAY_INTERVAL_MS) return;
+    lastShown = now;
+    speed = (p.done - first.done) / span;
+    const remaining = speed > 0 ? (p.total - p.done) / speed : null;
+    // Let the estimate fall freely but rise only slowly, so it does not bounce.
+    shownEta =
+      remaining === null || shownEta === null || remaining < shownEta
+        ? remaining
+        : shownEta + (remaining - shownEta) * 0.25;
+    eta = shownEta;
   });
 
   let current = $derived(progress?.phase ?? steps[0]);
   let currentIndex = $derived(steps.indexOf(current));
   let fraction = $derived(progress && progress.total > 0 ? progress.done / progress.total : 0);
-  let eta = $derived(progress && speed > 0 ? (progress.total - progress.done) / speed : null);
   let indeterminate = $derived(current === "formatting" || !progress);
 </script>
 
@@ -67,7 +85,7 @@
       <span>{t.progressOf(bytes(progress.done), bytes(progress.total))}</span>
       <span>
         {#if speed > 0}{rate(speed)}{/if}
-        {#if eta !== null}&nbsp;· {t.progressLeft(duration(eta))}{/if}
+        {#if eta !== null}&nbsp;· {t.timeLeft(roundEta(eta))}{/if}
       </span>
     {/if}
   </div>
