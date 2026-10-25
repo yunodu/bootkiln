@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 export interface Drive {
   number: number;
@@ -132,6 +133,14 @@ export const onDownloadProgress = (handler: (p: DownloadProgress) => void): Prom
   listen<DownloadProgress>("download-progress", (e) => handler(e.payload));
 export const onDownloadFinished = (handler: (f: DownloadFinished) => void): Promise<UnlistenFn> =>
   listen<DownloadFinished>("download-finished", (e) => handler(e.payload));
+
+export interface Update {
+  version: string;
+  url: string;
+}
+
+export const checkUpdate = () => invoke<Update | null>("check_update");
+export const openReleasePage = (url: string) => openUrl(url);
 
 /** Calls `onHover(true/false)` while files are dragged over the window and `onDrop` with the first path. */
 export const onFileDrop = (onHover: (over: boolean) => void, onDrop: (path: string) => void): Promise<UnlistenFn> =>

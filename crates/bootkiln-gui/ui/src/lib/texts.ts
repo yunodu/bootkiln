@@ -3,6 +3,7 @@ import type { ImageInfo, Note, Phase } from "./api";
 
 export const t = {
   appTagline: "Bootable USB drives, made simple",
+  updateAvailable: (version: string) => `Version ${version} is available`,
 
   driveTitle: "Drive",
   driveEmpty: "Plug in a USB drive or SD card",

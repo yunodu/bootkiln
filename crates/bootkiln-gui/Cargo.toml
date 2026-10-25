@@ -3,6 +3,7 @@ name = "bootkiln-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "bootkiln-gui"
@@ -20,3 +21,4 @@ bootkiln-platform = { path = "../bootkiln-platform" }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2.12", features = [] }
 tauri-plugin-dialog = "2.8"
+tauri-plugin-opener = "2"

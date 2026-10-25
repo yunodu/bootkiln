@@ -118,3 +118,13 @@ pub fn discard_download(release: Release) -> Result<(), String> {
     let dir = bootkiln_catalog::default_download_dir().map_err(|e| e.to_string())?;
     bootkiln_catalog::discard_partial(&release, &dir).map_err(|e| e.to_string())
 }
+
+/// A newer bootkiln release, if any (notify only).
+#[tauri::command]
+pub async fn check_update() -> Result<Option<bootkiln_catalog::update::Update>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        bootkiln_catalog::update::newer_release(env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

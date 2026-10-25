@@ -57,6 +57,7 @@
   let resolved = $state<Record<string, Resolved>>({});
   let windowsLanguage = $state("");
   let download = $state<DownloadView | null>(null);
+  let update = $state<api.Update | null>(null);
   let downloading: { release: api.Release; entry: api.CatalogEntry } | null = null;
 
   let drive = $derived(drives.find((d) => d.number === driveNumber) ?? null);
@@ -265,6 +266,8 @@
 
   onMount(() => {
     api.mica().then((on) => document.documentElement.classList.toggle("mica", on));
+    // Notify only; offline or a GitHub hiccup just means no notice.
+    api.checkUpdate().then((u) => (update = u), () => {});
     api.listDrives().then(setDrives, (e) => (checkError = String(e)));
     const subscriptions = [
       api.onDrivesChanged(setDrives),
@@ -290,6 +293,12 @@
       <h1>bootkiln</h1>
       <p>{t.appTagline}</p>
     </div>
+    {#if update}
+      {@const found = update}
+      <button class="update fade-in" onclick={() => api.openReleasePage(found.url)}>
+        {t.updateAvailable(found.version)}
+      </button>
+    {/if}
   </header>
 
   <main class:centered={view === "running" || view === "result"}>
@@ -376,6 +385,21 @@
     margin: 0;
     font-size: 12.5px;
     color: var(--text-faint);
+  }
+
+  .update {
+    margin-left: auto;
+    padding: 5px 12px;
+    border: none;
+    border-radius: 999px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .update:hover {
+    filter: brightness(1.1);
   }
 
   main {

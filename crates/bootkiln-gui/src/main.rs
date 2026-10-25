@@ -347,6 +347,7 @@ fn main() {
     let state = Arc::new(WriteState::default());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(Arc::clone(&state))
         .manage(Arc::new(downloads::DownloadState::default()))
         .setup(move |app| {
@@ -367,7 +368,8 @@ fn main() {
             downloads::start_download,
             downloads::pause_download,
             downloads::cancel_download,
-            downloads::discard_download
+            downloads::discard_download,
+            downloads::check_update
         ])
         .run(tauri::generate_context!())
         .expect("running bootkiln");

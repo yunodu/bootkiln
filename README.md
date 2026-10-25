@@ -2,6 +2,14 @@
 
 Write bootable disk images to USB drives. Windows today; Linux planned.
 
+## Download
+
+Get `bootkiln-gui.exe` (desktop app) and/or `bootkiln.exe` (command line) from [Releases](https://github.com/yunodu/bootkiln/releases); `SHA256SUMS.txt` lists their checksums. Both are portable: no installer, nothing to set up. Windows 10 / 11 x64.
+
+The executables are not code-signed yet, so Windows SmartScreen may say "Windows protected your PC". Choose **More info** → **Run anyway**. The app then asks for administrator rights, which raw disk access needs.
+
+The app checks GitHub for a newer release at start and shows a link if there is one; it never downloads or installs updates itself.
+
 ## Status (v0.1)
 
 - `bootkiln-gui.exe` — desktop app (portable, single exe) for the same workflow; see [GUI](#gui).
@@ -114,9 +122,19 @@ After a DD write of a hybrid ISO, Windows usually reports the drive as unformatt
 | `bootkiln-core` | `Drive`, `DiskBackend` / `BlockDevice` traits, image inspection, ISO 9660 and UDF readers, FAT32 and UEFI:NTFS layouts, ISO mode, Windows detection and answer files, write + verify of a `Plan` (device runs), file-tree copy + verify |
 | `bootkiln-platform` | Native backends (`windows.rs`: `\\.\PhysicalDriveN`, volume lock / dismount, unbuffered I/O, NTFS formatting; `region.rs`: regional settings) |
 | `bootkiln-cli` | `bootkiln` command-line tool |
-| `bootkiln-catalog` | OS catalog: release resolvers per distro, resumable SHA-256-verified downloads |
+| `bootkiln-catalog` | OS catalog: release resolvers per distro, resumable SHA-256-verified downloads; update check |
 | `bootkiln-gui` | `bootkiln-gui` desktop app (Tauri; UI in `ui/`) |
+
+## Releasing
+
+1. Set the version in `Cargo.toml` (`[workspace.package]`) and move the `CHANGELOG.md` entries under a heading for it, e.g. `## [0.2.0] - 2026-11-30`.
+2. Commit, tag and push: `git tag v0.2.0 && git push origin main v0.2.0`.
+3. The [Release workflow](.github/workflows/release.yml) checks that the tag matches the Cargo version, runs the tests, builds both executables and publishes a GitHub release with `SHA256SUMS.txt` and the changelog section as notes. CI runs clippy and the tests on every push and pull request.
+
+## License
+
+bootkiln is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 
 ## Third-party components
 
-`crates/bootkiln-core/assets/uefi-ntfs.img` is UEFI:NTFS from Rufus, licensed under the GPL (v2 or later, and v3 or later for some drivers). It is embedded in the `bootkiln` binary and written unmodified to NTFS drives. Provenance, licenses and source links: [`crates/bootkiln-core/assets/README.md`](crates/bootkiln-core/assets/README.md).
+`crates/bootkiln-core/assets/uefi-ntfs.img` is UEFI:NTFS from Rufus, licensed under the GPL (v2 or later, and v3 or later for some drivers). It is embedded in the bootkiln executables as a separate work and written unmodified to NTFS drives. Provenance, licenses and source links: [`crates/bootkiln-core/assets/README.md`](crates/bootkiln-core/assets/README.md).

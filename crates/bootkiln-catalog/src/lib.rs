@@ -1,5 +1,6 @@
 //! The OS catalog: which operating systems bootkiln can download, how to find each one's
 //! latest release on its official servers, and a resumable, checksum-verified downloader.
+//! Also bootkiln's own update check ([`update`]).
 //!
 //! Every entry has a resolver that reads the distro's own release index at run time, so
 //! there is no catalog file to host or update. If a distro changes its site, only that
@@ -8,6 +9,7 @@
 mod download;
 mod http;
 mod linux;
+pub mod update;
 mod windows;
 
 use serde::Serialize;
