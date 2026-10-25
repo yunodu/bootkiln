@@ -3,10 +3,11 @@
   import logo from "../../icons/icon.svg?url";
   import * as api from "./lib/api";
   import AdvancedCard from "./lib/AdvancedCard.svelte";
+  import CatalogSheet, { type Resolved } from "./lib/CatalogSheet.svelte";
   import ConfirmDialog from "./lib/ConfirmDialog.svelte";
   import DriveCard from "./lib/DriveCard.svelte";
   import Icon from "./lib/Icon.svelte";
-  import ImageCard from "./lib/ImageCard.svelte";
+  import ImageCard, { type DownloadView } from "./lib/ImageCard.svelte";
   import ProgressView from "./lib/ProgressView.svelte";
   import ResultView from "./lib/ResultView.svelte";
   import WindowsCard from "./lib/WindowsCard.svelte";
@@ -51,10 +52,22 @@
   let outcome = $state<Outcome | null>(null);
   let ejectState = $state<"idle" | "busy" | "done" | { error: string }>("idle");
 
+  let catalogOpen = $state(false);
+  let entries = $state<api.CatalogEntry[]>([]);
+  let resolved = $state<Record<string, Resolved>>({});
+  let windowsLanguage = $state("");
+  let download = $state<DownloadView | null>(null);
+  let downloading: { release: api.Release; entry: api.CatalogEntry } | null = null;
+
   let drive = $derived(drives.find((d) => d.number === driveNumber) ?? null);
   let driveLabel = $derived(drive ? `${drive.model || "the drive"} (${drive.mountPoints[0] ?? bytes(drive.sizeBytes)})` : "");
   let ready = $derived(
-    drive !== null && info !== null && !analyzing && !imageError && !(localAccount && !accountName.trim()),
+    drive !== null &&
+      info !== null &&
+      download === null &&
+      !analyzing &&
+      !imageError &&
+      !(localAccount && !accountName.trim()),
   );
   let startLabel = $derived(checking ? t.checking : !drive ? t.pickDrive : !imagePath ? t.pickImage : t.start);
 
@@ -162,6 +175,94 @@
     }
   }
 
+  function resolveEntry(entry: api.CatalogEntry) {
+    resolved[entry.id] = { state: "loading" };
+    api
+      .resolveRelease(entry.id, entry.windows ? windowsLanguage : null)
+      .then((release) => (resolved[entry.id] = { state: "ok", release }))
+      .catch((e) => (resolved[entry.id] = { state: "error", error: String(e) }));
+  }
+
+  async function openCatalog() {
+    catalogOpen = true;
+    if (entries.length === 0) {
+      [entries, windowsLanguage] = await Promise.all([api.catalogEntries(), api.defaultWindowsLanguage()]);
+    }
+    // Errors are retried on every opening; good answers are kept for the session.
+    entries.filter((e) => resolved[e.id]?.state !== "ok").forEach(resolveEntry);
+  }
+
+  // A new Windows language needs a new link and checksum.
+  $effect(() => {
+    const language = windowsLanguage;
+    const windows = entries.find((e) => e.windows);
+    const current = windows ? resolved[windows.id] : undefined;
+    if (windows && current?.state === "ok" && current.release.language !== language) resolveEntry(windows);
+  });
+
+  async function beginDownload(release: api.Release, entry: api.CatalogEntry) {
+    catalogOpen = false;
+    downloading = { release, entry };
+    download = {
+      name: entry.name,
+      version: release.version,
+      color: entry.color,
+      status: "running",
+      stage: "downloading",
+      done: 0,
+      total: release.size ?? 0,
+      error: null,
+    };
+    try {
+      await api.startDownload(release);
+    } catch (e) {
+      download = { ...download, status: "failed", error: String(e) };
+    }
+  }
+
+  async function resumeDownload() {
+    if (!downloading || !download) return;
+    download = { ...download, status: "running", error: null };
+    let release = downloading.release;
+    // Microsoft's links expire after a day; fetch a fresh one for the same file.
+    if (downloading.entry.windows) {
+      try {
+        release = await api.resolveRelease(downloading.entry.id, release.language);
+        downloading = { ...downloading, release };
+      } catch (e) {
+        download = { ...download, status: "failed", error: String(e) };
+        return;
+      }
+    }
+    beginDownload(release, downloading.entry);
+  }
+
+  async function cancelDownload() {
+    if (download?.status === "running") {
+      await api.cancelDownload();
+    } else if (downloading) {
+      await api.discardDownload(downloading.release).catch(() => {});
+      download = null;
+      downloading = null;
+    }
+  }
+
+  function downloadFinished(f: api.DownloadFinished) {
+    if (!download) return;
+    if (f.path) {
+      download = null;
+      downloading = null;
+      chooseImage(f.path);
+    } else if (f.paused) {
+      download = { ...download, status: "paused" };
+    } else if (f.cancelled) {
+      download = null;
+      downloading = null;
+    } else {
+      download = { ...download, status: "failed", error: f.error };
+    }
+  }
+
   onMount(() => {
     api.mica().then((on) => document.documentElement.classList.toggle("mica", on));
     api.listDrives().then(setDrives, (e) => (checkError = String(e)));
@@ -173,6 +274,10 @@
         (over) => (dragOver = over && view === "form"),
         (path) => chooseImage(path),
       ),
+      api.onDownloadProgress((p) => {
+        if (download?.status === "running") download = { ...download, stage: p.stage, done: p.done, total: p.total };
+      }),
+      api.onDownloadFinished(downloadFinished),
     ];
     return () => subscriptions.forEach((s) => s.then((unlisten) => unlisten()));
   });
@@ -194,7 +299,19 @@
       <ResultView {outcome} {ejectState} onEject={eject} onClose={() => (view = "form")} />
     {:else}
       <DriveCard {drives} bind:selected={driveNumber} />
-      <ImageCard path={imagePath} {info} {analyzing} error={imageError} {dragOver} onBrowse={browse} />
+      <ImageCard
+        path={imagePath}
+        {info}
+        {analyzing}
+        error={imageError}
+        {dragOver}
+        {download}
+        onBrowse={browse}
+        onCatalog={openCatalog}
+        onPause={() => api.pauseDownload()}
+        onResume={resumeDownload}
+        onCancelDownload={cancelDownload}
+      />
       {#if info?.windows}
         <WindowsCard windows={info.windows} bind:options={winOptions} bind:localAccount bind:accountName />
       {/if}
@@ -216,6 +333,16 @@
 
 {#if view === "confirm"}
   <ConfirmDialog drive={driveLabel} onCancel={() => (view = "form")} onConfirm={confirmed} />
+{/if}
+
+{#if catalogOpen}
+  <CatalogSheet
+    {entries}
+    {resolved}
+    bind:language={windowsLanguage}
+    onDownload={beginDownload}
+    onClose={() => (catalogOpen = false)}
+  />
 {/if}
 
 <style>

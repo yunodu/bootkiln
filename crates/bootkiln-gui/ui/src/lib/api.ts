@@ -86,6 +86,53 @@ export const onProgress = (handler: (p: Progress) => void): Promise<UnlistenFn> 
 export const onFinished = (handler: (f: Finished) => void): Promise<UnlistenFn> =>
   listen<Finished>("write-finished", (e) => handler(e.payload));
 
+export interface CatalogEntry {
+  id: string;
+  name: string;
+  summary: string;
+  color: string;
+  windows: boolean;
+}
+
+export interface Release {
+  entry: string;
+  version: string;
+  fileName: string;
+  url: string;
+  sha256: string;
+  size: number | null;
+  language: string | null;
+  languages: string[];
+}
+
+export type DownloadStage = "checking" | "downloading";
+
+export interface DownloadProgress {
+  stage: DownloadStage;
+  done: number;
+  total: number;
+}
+
+export interface DownloadFinished {
+  path: string | null;
+  paused: boolean;
+  cancelled: boolean;
+  error: string | null;
+}
+
+export const catalogEntries = () => invoke<CatalogEntry[]>("catalog_entries");
+export const defaultWindowsLanguage = () => invoke<string>("default_windows_language");
+export const resolveRelease = (id: string, language: string | null) =>
+  invoke<Release>("resolve_release", { id, language });
+export const startDownload = (release: Release) => invoke<void>("start_download", { release });
+export const pauseDownload = () => invoke<void>("pause_download");
+export const cancelDownload = () => invoke<void>("cancel_download");
+export const discardDownload = (release: Release) => invoke<void>("discard_download", { release });
+export const onDownloadProgress = (handler: (p: DownloadProgress) => void): Promise<UnlistenFn> =>
+  listen<DownloadProgress>("download-progress", (e) => handler(e.payload));
+export const onDownloadFinished = (handler: (f: DownloadFinished) => void): Promise<UnlistenFn> =>
+  listen<DownloadFinished>("download-finished", (e) => handler(e.payload));
+
 /** Calls `onHover(true/false)` while files are dragged over the window and `onDrop` with the first path. */
 export const onFileDrop = (onHover: (over: boolean) => void, onDrop: (path: string) => void): Promise<UnlistenFn> =>
   getCurrentWebview().onDragDropEvent((e) => {

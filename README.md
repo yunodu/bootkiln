@@ -10,15 +10,16 @@ Write bootable disk images to USB drives. Windows today; Linux planned.
   - **ISO mode** — the drive gets the ISO's files, like Rufus's "ISO Image mode": on FAT32, or on NTFS plus a UEFI:NTFS boot partition when a file is 4 GiB or larger (e.g. Windows 11's `install.wim`). It boots on UEFI PCs and stays usable for other files. Linux ISOs and Windows 10 / 11 installer ISOs (x64, ARM64) are supported.
   - **DD mode** — byte-for-byte copy of the image (hybrid ISOs, raw `.img` disk images).
 - `bootkiln verify <image> -d <N>` — compare a drive written in DD mode with an image.
+- `bootkiln catalog` / `bootkiln download <id>` — download the latest release of a supported OS, verified against its published SHA-256; see [OS catalog](#os-catalog).
 
-Not yet: legacy BIOS boot in ISO mode, OS catalog / downloader, translations.
+Not yet: legacy BIOS boot in ISO mode, GPG signature checks of downloads, translations.
 
 ## GUI
 
 `bootkiln-gui.exe` is a [Tauri](https://tauri.app) app: the window is a Svelte + TypeScript UI in `crates/bootkiln-gui/ui`, the Rust side calls the same `bootkiln_core::job` workflow as the CLI. It asks for administrator rights at launch (UAC), follows the system's dark / light theme and uses the Windows 11 Mica backdrop.
 
 - **Drive** — removable drives, refreshed automatically when a drive is plugged in or out.
-- **Image** — file picker or drag and drop; shows how the image will be written and any warnings.
+- **Image** — file picker, drag and drop, or **Download an OS** from the catalog (progress, pause / resume, cancel); shows how the image will be written and any warnings.
 - **Windows setup** — shown for Windows installer ISOs; the same answer-file options as the CLI's `--win-*` flags.
 - **Advanced** — write mode (Auto / ISO / DD) and read-back verification.
 - **Start** checks the write without touching the drive, then asks for confirmation. Progress shows the phase, speed and time left; **Cancel** stops within seconds and leaves the drive incomplete. After success, **Eject** safely removes the drive.
@@ -32,6 +33,29 @@ npx tauri build --no-bundle
 ```
 
 The exe is `target\release\bootkiln-gui.exe`. All UI text lives in `ui/src/lib/texts.ts`.
+
+## OS catalog
+
+| Id | OS | Source |
+|---|---|---|
+| `ubuntu` | Ubuntu Desktop, latest LTS | `releases.ubuntu.com` |
+| `kubuntu` | Kubuntu, latest LTS | `cdimage.ubuntu.com` |
+| `fedora-workstation`, `fedora-kde` | Fedora Workstation / KDE Plasma | `fedoraproject.org/releases.json` |
+| `linuxmint` | Linux Mint Cinnamon | `mirrors.edge.kernel.org/linuxmint` |
+| `debian`, `debian-live-kde` | Debian netinst / Live KDE | `cdimage.debian.org` |
+| `arch` | Arch Linux | `geo.mirror.pkgbuild.com` (Arch's CDN) |
+| `windows11` | Windows 11 x64 (Home / Pro / Education) | Microsoft's download page |
+
+- Each entry finds its latest release when the catalog is opened, by reading the distro's own release index; there is no catalog file to maintain. When a distro changes its site, only that entry shows as unavailable.
+- Every download is checked against the SHA-256 the vendor publishes over HTTPS (checksum lists, Fedora's `releases.json`, the hash table on Microsoft's page). A mismatch deletes the file.
+- Files go to `downloads\` next to the bootkiln executable. A finished file is reused when its checksum still matches; an interrupted or paused download (`<file>.part`) resumes where it stopped.
+- Windows 11 uses the requests Microsoft's own download page makes (as Rufus's Fido does). Microsoft has no official API for this and has blocked it before; the error then says Microsoft refused. The language defaults to this PC's (`--lang` in the CLI, a list in the GUI). Download links last 24 hours; resuming later fetches a fresh one.
+
+```
+target\release\bootkiln catalog
+target\release\bootkiln download debian
+target\release\bootkiln download windows11 --lang German
+```
 
 ## Usage
 
@@ -90,6 +114,7 @@ After a DD write of a hybrid ISO, Windows usually reports the drive as unformatt
 | `bootkiln-core` | `Drive`, `DiskBackend` / `BlockDevice` traits, image inspection, ISO 9660 and UDF readers, FAT32 and UEFI:NTFS layouts, ISO mode, Windows detection and answer files, write + verify of a `Plan` (device runs), file-tree copy + verify |
 | `bootkiln-platform` | Native backends (`windows.rs`: `\\.\PhysicalDriveN`, volume lock / dismount, unbuffered I/O, NTFS formatting; `region.rs`: regional settings) |
 | `bootkiln-cli` | `bootkiln` command-line tool |
+| `bootkiln-catalog` | OS catalog: release resolvers per distro, resumable SHA-256-verified downloads |
 | `bootkiln-gui` | `bootkiln-gui` desktop app (Tauri; UI in `ui/`) |
 
 ## Third-party components

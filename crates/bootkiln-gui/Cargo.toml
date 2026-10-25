@@ -14,6 +14,7 @@ test = false
 tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
+bootkiln-catalog = { version = "0.1.0", path = "../bootkiln-catalog" }
 bootkiln-core = { path = "../bootkiln-core" }
 bootkiln-platform = { path = "../bootkiln-platform" }
 serde = { version = "1", features = ["derive"] }

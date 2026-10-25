@@ -31,6 +31,23 @@ enum Command {
         #[arg(short, long)]
         drive: u32,
     },
+    /// List the operating systems bootkiln can download, with their latest versions
+    Catalog {
+        /// Windows language (a name from the Windows entry's list; default: this PC's)
+        #[arg(long, value_name = "LANGUAGE")]
+        lang: Option<String>,
+    },
+    /// Download an operating system from the catalog and verify its checksum
+    Download {
+        /// Catalog id from `bootkiln catalog`, e.g. `ubuntu` or `windows11`
+        id: String,
+        /// Windows language, e.g. "English" or "German" (default: this PC's)
+        #[arg(long, value_name = "LANGUAGE")]
+        lang: Option<String>,
+        /// Folder to download into (default: `downloads` next to bootkiln)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -124,6 +141,8 @@ fn main() -> Result<()> {
         Command::List => list(&backend),
         Command::Write(args) => write(&backend, &args),
         Command::Verify { image, drive } => verify(&backend, &image, drive),
+        Command::Catalog { lang } => catalog(lang.as_deref()),
+        Command::Download { id, lang, dir } => download(&id, lang.as_deref(), dir),
     }
 }
 
@@ -274,6 +293,83 @@ fn verify(backend: &dyn DiskBackend, image_path: &Path, drive_no: u32) -> Result
     Ok(())
 }
 
+/// Microsoft's language name: the one given, else this PC's language, else English.
+fn windows_language(lang: Option<&str>) -> String {
+    lang.map(str::to_owned)
+        .or_else(|| {
+            host_region().ok().and_then(|r| bootkiln_catalog::default_windows_language(&r.user_locale)).map(str::to_owned)
+        })
+        .unwrap_or_else(|| bootkiln_catalog::WINDOWS_LANGUAGE_FALLBACK.to_owned())
+}
+
+fn catalog(lang: Option<&str>) -> Result<()> {
+    let language = windows_language(lang);
+    // Each entry asks a different server; resolve them side by side.
+    let results: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = bootkiln_catalog::ENTRIES
+            .iter()
+            .map(|e| {
+                let language = &language;
+                s.spawn(move || bootkiln_catalog::resolve(e.id, e.windows.then_some(language.as_str())))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("resolver thread")).collect()
+    });
+    println!("{:<20} {:<20} {:<18} {:>10}  File", "Id", "Name", "Version", "Size");
+    for (entry, result) in bootkiln_catalog::ENTRIES.iter().zip(results) {
+        match result {
+            Ok(r) => println!(
+                "{:<20} {:<20} {:<18} {:>10}  {}",
+                entry.id,
+                entry.name,
+                r.version,
+                r.size.map(|s| HumanBytes(s).to_string()).unwrap_or_default(),
+                r.file_name
+            ),
+            Err(e) => println!("{:<20} {:<20} unavailable: {e}", entry.id, entry.name),
+        }
+    }
+    Ok(())
+}
+
+fn download(id: &str, lang: Option<&str>, dir: Option<PathBuf>) -> Result<()> {
+    let entry = bootkiln_catalog::ENTRIES
+        .iter()
+        .find(|e| e.id == id)
+        .with_context(|| format!("no catalog entry {id}; run `bootkiln catalog`"))?;
+    let language = entry.windows.then(|| windows_language(lang));
+    let release = bootkiln_catalog::resolve(id, language.as_deref())?;
+    let dir = match dir {
+        Some(dir) => dir,
+        None => bootkiln_catalog::default_download_dir()?,
+    };
+    println!("{} {} -> {}", entry.name, release.version, dir.join(&release.file_name).display());
+
+    let mut bar: Option<(bootkiln_catalog::Stage, ProgressBar)> = None;
+    let path = bootkiln_catalog::download(&release, &dir, &mut |stage, done, total| {
+        if bar.as_ref().is_none_or(|(s, _)| *s != stage) {
+            if let Some((_, old)) = bar.take() {
+                old.finish();
+            }
+            let label = match stage {
+                bootkiln_catalog::Stage::Checking => "Checking",
+                bootkiln_catalog::Stage::Downloading => "Downloading",
+            };
+            bar = Some((stage, byte_bar(total, label)));
+        }
+        if let Some((_, bar)) = &bar {
+            bar.set_length(total);
+            bar.set_position(done);
+        }
+        Ok(())
+    })?;
+    if let Some((_, bar)) = bar {
+        bar.finish();
+    }
+    println!("Verified (SHA-256 {}): {}", release.sha256, path.display());
+    Ok(())
+}
+
 fn require_elevated(backend: &dyn DiskBackend) -> Result<()> {
     if !backend.is_elevated() {
         bail!("raw disk access needs administrator rights; run bootkiln from an elevated terminal");
@@ -305,9 +401,13 @@ fn progress_bar(len: u64, phase: Phase) -> ProgressBar {
         Phase::Formatting => "Formatting",
         Phase::Copying => "Copying",
     };
+    byte_bar(len, label)
+}
+
+fn byte_bar(len: u64, label: &'static str) -> ProgressBar {
     let bar = ProgressBar::new(len).with_message(label);
     bar.set_style(
-        ProgressStyle::with_template("{msg:>10} [{bar:40}] {bytes}/{total_bytes} {binary_bytes_per_sec} ETA {eta}")
+        ProgressStyle::with_template("{msg:>11} [{bar:40}] {bytes}/{total_bytes} {binary_bytes_per_sec} ETA {eta}")
             .expect("valid progress template")
             .progress_chars("=> "),
     );

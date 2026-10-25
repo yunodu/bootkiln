@@ -3,6 +3,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod downloads;
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -346,6 +348,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::clone(&state))
+        .manage(Arc::new(downloads::DownloadState::default()))
         .setup(move |app| {
             watch_drives(app.handle().clone(), state);
             Ok(())
@@ -357,7 +360,14 @@ fn main() {
             check_write,
             start_write,
             cancel_write,
-            eject_drive
+            eject_drive,
+            downloads::catalog_entries,
+            downloads::default_windows_language,
+            downloads::resolve_release,
+            downloads::start_download,
+            downloads::pause_download,
+            downloads::cancel_download,
+            downloads::discard_download
         ])
         .run(tauri::generate_context!())
         .expect("running bootkiln");
