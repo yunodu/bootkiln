@@ -80,6 +80,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
+name = "bootkiln-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bootkiln-core",
+ "bootkiln-platform",
+ "clap",
+ "indicatif",
+]
+
+[[package]]
+name = "bootkiln-core"
+version = "0.1.0"
+dependencies = [
+ "fatfs",
+ "thiserror",
+]
+
+[[package]]
+name = "bootkiln-platform"
+version = "0.1.0"
+dependencies = [
+ "bootkiln-core",
+ "windows-sys",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -360,33 +387,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "scribe-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "indicatif",
- "scribe-core",
- "scribe-platform",
-]
-
-[[package]]
-name = "scribe-core"
-version = "0.1.0"
-dependencies = [
- "fatfs",
- "thiserror",
-]
-
-[[package]]
-name = "scribe-platform"
-version = "0.1.0"
-dependencies = [
- "scribe-core",
- "windows-sys",
-]
 
 [[package]]
 name = "shlex"

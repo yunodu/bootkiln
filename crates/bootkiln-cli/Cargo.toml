@@ -1,16 +1,16 @@
 [package]
-name = "scribe-cli"
+name = "bootkiln-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "scribe"
+name = "bootkiln"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 indicatif = "0.18.6"
-scribe-core = { path = "../scribe-core" }
-scribe-platform = { path = "../scribe-platform" }
+bootkiln-core = { path = "../bootkiln-core" }
+bootkiln-platform = { path = "../bootkiln-platform" }

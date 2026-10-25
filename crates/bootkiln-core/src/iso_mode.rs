@@ -15,7 +15,7 @@ use crate::plan::{Plan, Source};
 /// Boot configuration files larger than this are not scanned for the label.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const CONFIG_EXTENSIONS: [&str; 2] = [".cfg", ".conf"];
-const FALLBACK_LABEL: &str = "SCRIBE";
+const FALLBACK_LABEL: &str = "BOOTKILN";
 const COMPARE_CHUNK: usize = 1024 * 1024;
 
 #[derive(Debug)]
@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(fat_label("Fedora-KDE-Live-44"), "FEDORA-KDE-");
         assert_eq!(fat_label("Ubuntu 24.04 LTS"), "UBUNTU_24_0");
         assert_eq!(fat_label("ARCH_202410"), "ARCH_202410");
-        assert_eq!(fat_label(""), "SCRIBE");
+        assert_eq!(fat_label(""), "BOOTKILN");
     }
 
     #[test]

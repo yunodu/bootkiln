@@ -1,4 +1,4 @@
-//! Platform-independent logic for scribe: drive model, image inspection, ISO 9660
+//! Platform-independent logic for bootkiln: drive model, image inspection, ISO 9660
 //! reading, FAT32 layout, and the write / verify pipeline.
 
 pub mod buffer;

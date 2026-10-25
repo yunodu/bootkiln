@@ -1,14 +1,14 @@
-# scribe
+# bootkiln
 
 Write bootable disk images to USB drives. Windows today; Linux planned.
 
 ## Status (v0.1)
 
-- `scribe list` — removable USB / SD drives (system disk and internal disks are never shown).
-- `scribe write <image> -d <N>` — write an ISO or disk image, then read-back verification. Two modes:
+- `bootkiln list` — removable USB / SD drives (system disk and internal disks are never shown).
+- `bootkiln write <image> -d <N>` — write an ISO or disk image, then read-back verification. Two modes:
   - **ISO mode** — the drive gets one FAT32 partition holding the ISO's files, like Rufus's "ISO Image mode". It boots on UEFI PCs (Secure Boot works if the ISO's loader is signed) and stays usable for other files.
   - **DD mode** — byte-for-byte copy of the image (hybrid ISOs, raw `.img` disk images).
-- `scribe verify <image> -d <N>` — compare a drive written in DD mode with an image.
+- `bootkiln verify <image> -d <N>` — compare a drive written in DD mode with an image.
 
 Not yet: Windows installer ISOs (UDF, `install.wim` over 4 GiB), legacy BIOS boot in ISO mode, OS catalog / downloader, GUI.
 
@@ -18,8 +18,8 @@ Writing and verifying need an elevated (Administrator) terminal.
 
 ```
 cargo build --release
-target\release\scribe list
-target\release\scribe write Fedora-KDE-Desktop-Live-44-1.7.x86_64.iso -d 3
+target\release\bootkiln list
+target\release\bootkiln write Fedora-KDE-Desktop-Live-44-1.7.x86_64.iso -d 3
 ```
 
 `write` asks you to type the drive number before erasing. Flags: `--mode auto|iso|dd` (default `auto`), `--yes` skips the prompt, `--no-verify` skips read-back, `--force` writes images that do not look raw-bootable in DD mode.
@@ -50,6 +50,6 @@ After a DD write of a hybrid ISO, Windows usually reports the drive as unformatt
 
 | Crate | Role |
 |---|---|
-| `scribe-core` | `Drive`, `DiskBackend` / `BlockDevice` traits, image inspection, ISO 9660 reader, FAT32 layout, ISO mode, write + verify of a `Plan` (device runs) |
-| `scribe-platform` | Native backends (`windows.rs`: `\\.\PhysicalDriveN`, volume lock / dismount, unbuffered I/O) |
-| `scribe-cli` | `scribe` command-line tool |
+| `bootkiln-core` | `Drive`, `DiskBackend` / `BlockDevice` traits, image inspection, ISO 9660 reader, FAT32 layout, ISO mode, write + verify of a `Plan` (device runs) |
+| `bootkiln-platform` | Native backends (`windows.rs`: `\\.\PhysicalDriveN`, volume lock / dismount, unbuffered I/O) |
+| `bootkiln-cli` | `bootkiln` command-line tool |

@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-use scribe_core::image::{self, ImageInfo, ImageKind};
-use scribe_core::iso_mode::{self, IsoModeLayout};
-use scribe_core::{DiskBackend, Drive, Error, Plan, verify_plan, write_plan};
-use scribe_platform::NativeBackend;
+use bootkiln_core::image::{self, ImageInfo, ImageKind};
+use bootkiln_core::iso_mode::{self, IsoModeLayout};
+use bootkiln_core::{DiskBackend, Drive, Error, Plan, verify_plan, write_plan};
+use bootkiln_platform::NativeBackend;
 
 #[derive(Parser)]
-#[command(name = "scribe", version, about = "Write bootable disk images to USB drives")]
+#[command(name = "bootkiln", version, about = "Write bootable disk images to USB drives")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -26,7 +26,7 @@ enum Command {
     Write {
         /// Image file (.iso / .img)
         image: PathBuf,
-        /// Target disk number from `scribe list`
+        /// Target disk number from `bootkiln list`
         #[arg(short, long)]
         drive: u32,
         /// How to put the image on the drive
@@ -227,7 +227,7 @@ fn verify(backend: &dyn DiskBackend, image_path: &Path, drive_no: u32) -> Result
 
 fn require_elevated(backend: &dyn DiskBackend) -> Result<()> {
     if !backend.is_elevated() {
-        bail!("raw disk access needs administrator rights; run scribe from an elevated terminal");
+        bail!("raw disk access needs administrator rights; run bootkiln from an elevated terminal");
     }
     Ok(())
 }
@@ -245,7 +245,7 @@ fn target_drive(backend: &dyn DiskBackend, number: u32) -> Result<Drive> {
         .context("listing drives")?
         .into_iter()
         .find(|d| d.number == number)
-        .with_context(|| format!("no drive {number}; run `scribe list`"))?;
+        .with_context(|| format!("no drive {number}; run `bootkiln list`"))?;
     if drive.is_system {
         bail!("drive {number} holds the running Windows installation; refusing to write it");
     }

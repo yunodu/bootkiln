@@ -9,7 +9,7 @@ use std::ptr::{null, null_mut};
 use std::thread::sleep;
 use std::time::Duration;
 
-use scribe_core::{BlockDevice, BusKind, DiskBackend, Drive};
+use bootkiln_core::{BlockDevice, BusKind, DiskBackend, Drive};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, GENERIC_READ, GENERIC_WRITE, HANDLE,
     INVALID_HANDLE_VALUE, MAX_PATH,
