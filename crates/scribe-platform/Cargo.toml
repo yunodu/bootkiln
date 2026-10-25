@@ -1,0 +1,11 @@
+[package]
+name = "scribe-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scribe-core = { path = "../scribe-core" }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security", "Win32_System_Threading", "Win32_System_SystemInformation"] }
